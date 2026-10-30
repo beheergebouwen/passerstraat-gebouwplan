@@ -1,7 +1,7 @@
 // Data layer: Microsoft 365 login (MSAL) + SharePoint lists via Microsoft Graph.
 (function () {
   const C = window.LK_CONFIG;
-  const SCOPES = ['Sites.ReadWrite.All', 'User.Read'];
+  const SCOPES = window.LK_SCOPES || ['Sites.ReadWrite.All', 'User.Read'];
   const msal = new window.msal.PublicClientApplication({
     auth: { clientId: C.clientId, authority: 'https://login.microsoftonline.com/' + C.tenantId, redirectUri: location.origin + location.pathname.replace(/index\.html$/, '') },
     cache: { cacheLocation: 'localStorage' }
