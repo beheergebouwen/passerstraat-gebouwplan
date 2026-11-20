@@ -19,6 +19,8 @@
     vo:      { org: 'Title', date: 'Datum', amount: 'Bedrag', desc: 'Omschrijving', rel: 'Relatie', entry: 'Boekstuk', uid: 'Uid', src: 'Bron' },
     imp:     { file: 'Title', at: 'Tijdstip', from: 'Van', to: 'Tot', lines: 'Lijnen', added: 'Nieuw', changed: 'Gewijzigd', removed: 'Verwijderd', who: 'Door', note: 'Opmerking' },
     occ:     { room: 'Title', org: 'Organisatie', from: 'Van', to: 'Tot', note: 'Opmerking' },
+    rent:    { org: 'Title', from: 'Van', to: 'Tot', base: 'Beginhuur', baseIdx: 'Beginindex', idxMonth: 'Indexmaand', m2: 'M2Contract', note: 'Opmerking', email: 'Email', parent: 'HoofdContract' },
+    idx:     { month: 'Title', value: 'Index2013', src: 'Bron' },
     settings:{ key: 'Title', period: 'Periode', heatCost: 'Verwarmingskost', totalUnits: 'EenhedenTotaal', rentTotal: 'HuurVerdelers', meterCount: 'AantalMeters', rules: 'Regels' }
   };
   const t = (n, type) => ({ name: n, [type || 'text']: type === 'number' ? { decimalPlaces: 'automatic' } : type === 'boolean' ? {} : type === 'choice' ? undefined : {} });
@@ -35,6 +37,8 @@
     occ: [t('Organisatie'), { name: 'Van', dateTime: { format: 'dateOnly' } }, { name: 'Tot', dateTime: { format: 'dateOnly' } }, { name: 'Opmerking', text: { allowMultipleLines: true } }],
     costs: [t('Categorie'), { name: 'Van', dateTime: { format: 'dateOnly' } }, { name: 'Tot', dateTime: { format: 'dateOnly' } }, t('Bedrag', 'number'), t('Sleutel'), t('Organisatie'), t('Leverancier'), t('Factuurnr'), t('Meter'), { name: 'Opmerking', text: { allowMultipleLines: true } }, t('Uid'), t('Boekstuk'), t('Boekdatum'), t('Grootboek'), t('Bron'), t('Kostendrager'), t('Btw')],
     vo: [{ name: 'Datum', dateTime: { format: 'dateOnly' } }, t('Bedrag', 'number'), t('Omschrijving'), t('Relatie'), t('Boekstuk'), t('Uid'), t('Bron')],
+    rent: [{ name: 'Van', dateTime: { format: 'dateOnly' } }, { name: 'Tot', dateTime: { format: 'dateOnly' } }, t('Beginhuur', 'number'), t('Beginindex', 'number'), t('Indexmaand'), t('M2Contract', 'number'), { name: 'Opmerking', text: { allowMultipleLines: true } }, t('Email'), t('HoofdContract')],
+    idx: [t('Index2013', 'number'), t('Bron')],
     imp: [t('Tijdstip'), t('Van'), t('Tot'), t('Lijnen', 'number'), t('Nieuw', 'number'), t('Gewijzigd', 'number'), t('Verwijderd', 'number'), t('Door'), { name: 'Opmerking', text: { allowMultipleLines: true } }]
   };
 
@@ -48,7 +52,7 @@
     if (!r.ok) { let m = r.status + ''; try { m = (await r.json()).error.message; } catch (e) {} const err = new Error(m); err.status = r.status; throw err; }
     return r.status === 204 ? null : (r.headers.get('content-type') || '').includes('json') ? r.json() : r.blob();
   }
-  const DK = { occ: { Van: 1, Tot: 1 }, costs: { Van: 1, Tot: 1 }, vo: { Datum: 1 } };
+  const DK = { occ: { Van: 1, Tot: 1 }, costs: { Van: 1, Tot: 1 }, vo: { Datum: 1 }, rent: { Van: 1, Tot: 1 } };
   const ymd = v => v ? new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Brussels' }).format(new Date(v)) : '';
   const toApp = (kind, f, id) => { const o = { _id: id }; for (const [a, s] of Object.entries(MAP[kind])) o[a] = DK[kind]?.[s] ? ymd(f[s]) : (f[s] ?? (typeof f[s] === 'boolean' ? false : '')); return o; };
   const toSp = (kind, o) => { const f = {}; for (const [a, s] of Object.entries(MAP[kind])) if (a in o) f[s] = DK[kind]?.[s] ? (o[a] ? o[a] + 'T12:00:00Z' : null) : (o[a] === '' && /M2|Verbruik|Stand|kost|Eenheden|Huur|Aantal|Bedrag|Lijnen|Nieuw|Gewijzigd|Verwijderd/.test(s) ? null : o[a]); return f; };
@@ -114,6 +118,15 @@
         out.push(...r.responses); onStep && onStep(Math.min(i + 20, ops.length), ops.length);
       }
       return out;
+    },
+    async mailDraft({ to, subject, html, att }) {     // concept in Outlook van de aangemelde gebruiker (aparte toestemming Mail.ReadWrite)
+      const sc = { scopes: ['Mail.ReadWrite'], account };
+      let tk; try { tk = (await msal.acquireTokenSilent(sc)).accessToken; } catch (e) { tk = (await msal.acquireTokenPopup(sc)).accessToken; }
+      const body = { subject, body: { contentType: 'HTML', content: html }, toRecipients: String(to || '').split(/[;,\s]+/).filter(Boolean).map(a => ({ emailAddress: { address: a } })),
+        attachments: (att || []).map(a => ({ '@odata.type': '#microsoft.graph.fileAttachment', name: a.name, contentType: 'application/pdf', contentBytes: a.b64 })) };
+      const r = await fetch('https://graph.microsoft.com/v1.0/me/messages', { method: 'POST', headers: { Authorization: 'Bearer ' + tk, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      if (!r.ok) { let m = r.status + ''; try { m = (await r.json()).error.message; } catch (e) {} throw new Error(m); }
+      return r.json();
     },
     logout() { msal.logoutRedirect({ account }); },
     get siteId() { return siteId; }

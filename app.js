@@ -55,8 +55,13 @@ async function boot() {
   setInterval(() => { if (!document.hidden && !document.activeElement?.closest('form,select,input,textarea')) reload().then(() => renderAll(true)); }, 60000);
 }
 async function reload(first) {
-  const [rooms, doors, meters, orgs, settings, occ, costs, vo, imp] = await Promise.all(['rooms', 'doors', 'meters', 'orgs', 'settings', 'occ', 'costs', 'vo', 'imp'].map(k => LK.load(k).catch(() => null)));
+  const [rooms, doors, meters, orgs, settings, occ, costs, vo, imp, rent, idx] = await Promise.all(['rooms', 'doors', 'meters', 'orgs', 'settings', 'occ', 'costs', 'vo', 'imp', 'rent', 'idx'].map(k => LK.load(k).catch(() => null)));
   COSTS = costs || []; VOS = (vo || []).filter(v => v.org); IMPS = imp || [];
+  RENT = (rent || []).filter(r => r.org); IDX_ITEMS = (idx || []).filter(x => x.month && x.value !== ''); IDX = Object.fromEntries(IDX_ITEMS.map(x => [x.month, Number(x.value)]));
+  // index.json wordt elke dag automatisch bijgewerkt vanuit Statbel (GitHub Action); ontbrekende maanden aanvullen + bewaren in LK_Index
+  try { const j = await (await fetch('index.json?t=' + Date.now(), { cache: 'no-store' })).json(); IDX_AUTO = j.index2013 || {}; IDX_UPD = j.bijgewerkt || ''; } catch (e) { IDX_AUTO = {}; }
+  for (const [k, v] of Object.entries(IDX_AUTO)) if (!(k in IDX)) IDX[k] = Number(v);
+  syncIdx();
   OCC = (occ || []).filter(o => o.room && o.org);
   if (!rooms) { setStatus('ro', 'Lijsten niet gevonden'); const n = $('#notice'); n.hidden = false; n.textContent = 'De SharePoint-lijsten bestaan nog niet. Laat IT eenmalig setup/ uitvoeren (zie handleiding).'; throw new Error('no lists'); }
   S.rooms = Object.fromEntries(rooms.map(r => [r.code, r])); S.doors = Object.fromEntries(doors.map(d => [d.code, d]));
@@ -64,6 +69,7 @@ async function reload(first) {
   ORGS = (orgs || []).filter(o => o.name).map(o => ({ _id: o._id, name: o.name, color: o.color || '#e6e2d6', type: o.type || 'Huurder' })).sort((a, b) => a.name.localeCompare(b.name));
   S.settings = (settings || []).find(x => x.key === 'ista') || S.settings;
   { const rr = (settings || []).find(x => x.key === 'regels'); RULES_ID = rr ? rr._id : null; try { RULES = JSON.parse(rr && rr.rules || '{}'); } catch (e) { RULES = {}; } }
+  { const gg = (settings || []).find(x => x.key === 'genegeerd'); IGN_ID = gg ? gg._id : null; try { IGN = new Set(JSON.parse(gg && gg.rules || '[]')); } catch (e) { IGN = new Set(); } }
   for (const k of ['heatCost', 'totalUnits', 'rentTotal', 'meterCount']) S.settings[k] = Number(S.settings[k]) || 0;
   if (!per) { const y = +peil.slice(0, 4) - 1; per = { from: y + '-01-01', to: y + '-12-31' }; }   // standaard: vorig kalenderjaar
   if (!first) setStatus('live', 'Verbonden met SharePoint · ' + new Date().toLocaleTimeString('nl-BE', { hour: '2-digit', minute: '2-digit' }));
@@ -310,15 +316,38 @@ function renderIsta() {
   const dis = canWrite ? '' : 'disabled';
   $('#tIsta').innerHTML = `<thead><tr><th>Meternr</th><th>Unit</th><th>Ruimte (Ista)</th><th class="num">Verbruik</th><th>Ruimte in gebouw</th><th>Organisatie</th><th class="num">Verwarming</th><th class="num">Totaal</th><th>Opmerking</th></tr></thead><tbody>` +
     ms.sort((a, b) => a.unit.localeCompare(b.unit) || a.nr.localeCompare(b.nr)).map(m => { const r = roomOf(m.room); return `<tr data-nr="${esc(m.nr)}"><td class="mono">${esc(m.nr)}</td><td class="mono">${esc(m.unit)}</td><td>${esc(m.istaRoom)}</td>
-      <td class="num mono">${Number(m.units).toLocaleString('nl-BE')}</td><td><select ${dis} aria-label="Ruimte voor meter ${esc(m.nr)}" style="${m.room ? '' : 'border-color:var(--bad)'}">${opts(m.room)}</select>${r ? ` <button class="btn" data-go="${esc(r.code)}" style="padding:2px 8px;font-size:12px">plan</button>` : ''}</td>
+      <td class="num mono">${canWrite ? `<input class="ivu" inputmode="decimal" value="${Number(m.units) || ''}" placeholder="0" aria-label="Verbruik meter ${esc(m.nr)}" style="width:80px;text-align:right">` : Number(m.units).toLocaleString('nl-BE')}</td><td><select ${dis} aria-label="Ruimte voor meter ${esc(m.nr)}" style="${m.room ? '' : 'border-color:var(--bad)'}">${opts(m.room)}</select>${r ? ` <button class="btn" data-go="${esc(r.code)}" style="padding:2px 8px;font-size:12px">plan</button>` : ''}</td>
       <td>${orgOf(r) ? `<span class="swatch" style="background:${orgColor(orgOf(r))}"></span>${esc(orgOf(r))}` : (r ? '<span class="empty">–</span>' : '')}</td>
       <td class="num mono">${eur((Number(m.units) || 0) * price())}</td><td class="num mono">${eur(meterCost(m))}</td><td class="wrap">${esc(m.note)}</td></tr>`; }).join('') +
     `</tbody><tfoot><tr><th colspan="3">Totaal</th><th class="num mono">${totUnits.toLocaleString('nl-BE')}</th><th colspan="2"></th><th class="num mono">${eur(totUnits * price())}</th><th class="num mono">${eur(ms.reduce((s, m) => s + meterCost(m), 0))}</th><th></th></tr></tfoot>`;
-  $('#tIsta').onchange = async e => { const s = e.target.closest('select'); if (!s) return; const nr = s.closest('tr').dataset.nr; const body = { ...S.meters[nr], room: s.value };
+  $('#tIsta').onchange = async e => {
+    const iv = e.target.closest('input.ivu');
+    if (iv) { const nr = iv.closest('tr').dataset.nr, v = Number(String(iv.value).replace(/\s/g, '').replace(',', '.')) || 0, body = { ...S.meters[nr], units: v };
+      try { await save('meters', nr, body); S.meters[nr] = body; PSC = {}; renderAll(true); } catch (er) { iv.style.outline = '2px solid var(--bad)'; setStatus('ro', 'Niet opgeslagen: ' + (er.code || er.message)); } return; }
+    const s = e.target.closest('select'); if (!s) return; const nr = s.closest('tr').dataset.nr; const body = { ...S.meters[nr], room: s.value };
     try { await save('meters', nr, body); S.meters[nr] = body; renderAll(true); } catch (er) { s.style.outline = '2px solid var(--bad)'; setStatus('ro', 'Niet opgeslagen: ' + (er.code || er.message)); } };
   $('#tIsta').onclick = e => { const b = e.target.closest('[data-go]'); if (b) select(b.dataset.go); };
 }
+function orgUse(n) {
+  const has = s => String(s || '').split(' + ').includes(n), u = [];
+  const c = (k, l) => l && u.push(l + ' ' + k);
+  c('ruimte(n)', Object.values(S.rooms).filter(r => r.org === n).length);
+  c('bezettingslijn(en)', OCC.filter(o => o.org === n).length);
+  c('huurlijn(en)', RENT.filter(r => r.org === n).length);
+  c('kost(en)', COSTS.filter(x => has(x.org)).length);
+  c('voorschot(ten)', VOS.filter(v => v.org === n).length);
+  return u;
+}
 function bindOrgColors() {
+  $('#tOrgs').onclick = async e => {
+    const b = e.target.closest('.odel'); if (!b) return; const o = ORGS.find(x => x.name === b.closest('tr').dataset.org); if (!o) return;
+    const u = orgUse(o.name);
+    if (o.type === 'Eigenaar') { setStatus('ro', o.name + ' is de eigenaar en kan niet verwijderd worden'); return; }
+    if (u.length) { setStatus('ro', o.name + ' niet verwijderd: nog gekoppeld aan ' + u.join(', ') + '. Vertrekt de huurder? Geef dan een einddatum (Tot) in Bezetting en Huur & index.'); return; }
+    if (!confirm('Organisatie ' + o.name + ' verwijderen?')) return;
+    try { await LK.remove('orgs', o._id); ORGS = ORGS.filter(x => x !== o); refreshOrgUI(); renderAll(true); setStatus('live', o.name + ' verwijderd'); }
+    catch (er) { setStatus('ro', 'Niet verwijderd: ' + (er.status === 403 ? 'geen bewerkrechten.' : er.message)); }
+  };
   $('#tOrgs').onchange = e => { const inp = e.target.closest('input.ocol'); if (!inp) return; const o = ORGS.find(x => x.name === inp.closest('tr').dataset.org); if (o) saveOrg({ ...o, color: inp.value }, null); };
 }
 function renderOrgs() {
@@ -352,11 +381,11 @@ function renderOrgs() {
     msg.className = ''; msg.textContent = 'Opslaan…';
     await saveOrg({ name, color: $('#noColor').value, type: $('#noType').value }, msg);
   };
-  $('#tOrgs').innerHTML = `<thead><tr><th>Organisatie</th><th class="num">Ruimten in periode</th><th class="num">Nu (${dfmt(peil)})</th><th class="num">Gem. privatief m²</th><th>Aandeel</th><th class="num">Aandeel gemeensch. m²</th><th class="num">Totaal m²</th><th class="num">Verwarming Ista ${esc(S.settings.period || '')}</th></tr></thead><tbody>` +
+  $('#tOrgs').innerHTML = `<thead><tr><th>Organisatie</th><th class="num">Ruimten in periode</th><th class="num">Nu (${dfmt(peil)})</th><th class="num">Gem. privatief m²</th><th>Aandeel</th><th class="num">Aandeel gemeensch. m²</th><th class="num">Totaal m²</th><th class="num">Verwarming Ista ${esc(S.settings.period || '')}</th>${canWrite ? '<th></th>' : ''}</tr></thead><tbody>` +
     rows.map(x => `<tr data-org="${esc(x.o.name)}"><td><input type="color" class="ocol" value="${esc(x.o.color)}" ${dis} title="Kleur wijzigen" aria-label="Kleur ${esc(x.o.name)}"> ${esc(x.o.name)} <span class="empty" style="font-size:11px">${esc(x.o.type || '')}</span></td><td class="num">${x.n}</td><td class="num">${x.now}</td><td class="num mono">${m2f(x.avg)}</td>
       <td style="min-width:140px"><div class="bar"><span style="width:${(x.share * 100).toFixed(1)}%;background:${x.o.color}"></span></div><span class="mono" style="font-size:12px">${(x.share * 100).toFixed(2)}%</span></td>
-      <td class="num mono">${m2f(x.com)}</td><td class="num mono">${m2f(x.avg + x.com)}</td><td class="num mono">${x.heat ? eur(x.heat) : '–'}</td></tr>`).join('') +
-    `</tbody><tfoot><tr><th>Leegstand</th><th></th><th></th><th class="num mono">${m2f(vacant)}</th><th class="mono" style="font-size:12px">${privTot ? (vacant / privTot * 100).toFixed(2) : 0}%</th><th></th><th></th><th></th></tr></tfoot>`;
+      <td class="num mono">${m2f(x.com)}</td><td class="num mono">${m2f(x.avg + x.com)}</td><td class="num mono">${x.heat ? eur(x.heat) : '–'}</td>${canWrite ? `<td>${x.o.type === 'Eigenaar' ? '' : `<button class="occdel odel" title="${orgUse(x.o.name).length ? 'Kan niet: nog gekoppeld aan ' + esc(orgUse(x.o.name).join(', ')) : 'Organisatie verwijderen'}"${orgUse(x.o.name).length ? ' style="opacity:.35"' : ''}>✕</button>`}</td>` : ''}</tr>`).join('') +
+    `</tbody><tfoot><tr><th>Leegstand</th><th></th><th></th><th class="num mono">${m2f(vacant)}</th><th class="mono" style="font-size:12px">${privTot ? (vacant / privTot * 100).toFixed(2) : 0}%</th><th></th><th></th><th></th>${canWrite ? '<th></th>' : ''}</tr></tfoot>`;
 }
 // ---------- bezetting per periode (tijdlijn + tabel)
 // jaarkeuze (kalenderjaar) in Organisaties, Bezetting en Afrekening
@@ -440,7 +469,10 @@ function presentShares(A, B, equal, noOvm) {
 const eur2 = n => (Math.round(n * 100) / 100).toLocaleString('nl-BE', { style: 'currency', currency: 'EUR' });
 function weights(key, A, B, org) {
   const P = dnum(B) - dnum(A) + 1, w = {};
-  if (key === KEYS[3]) { if (org) w[org] = 1; return w; }
+  if (key === KEYS[3]) {   // één of meer organisaties ("A + B"); bij meerdere: verdeeld naar hun bezette m², anders gelijk
+    const sel = String(org || '').split(' + ').map(s => s.trim()).filter(Boolean); if (sel.length < 2) { if (sel[0]) w[sel[0]] = 1; return w; }
+    const ps = presentShares(A, B, false, true); let s = 0; for (const o of sel) { w[o] = ps[o] || 0; s += w[o]; } if (!s) for (const o of sel) w[o] = 1; return w;
+  }
   if (key === KEYS[1]) {   // meter in ruimte van een organisatie → die organisatie; leeg → De Overmolen; gemeenschappelijke ruimte → aanwezigen
     for (const m of Object.values(S.meters)) {
       const r = roomOf(m.room), u = Number(m.units) || 0; if (!r || !u) continue;
@@ -500,6 +532,25 @@ function bindAfr() {
     exportCsv('Passerstraat_afrekening_' + per.from + '_' + per.to + '.csv', ['categorie', 'omschrijving', 'leverancier', 'factuur', 'meter', 'van', 'tot', 'bedrag excl. btw', 'btw %', 'bedrag incl. btw', 'sleutel', ...orgs],
       cs.map(c => { const sp = split(c); return [c.cat, c.desc, c.supplier, c.invoice || c.entry, c.meter, dfmt(c.from), dfmt(c.to), ((Number(c.amount) || 0) * ovl(c).f).toFixed(2), Number(c.vat) || 0, amtIn(c).toFixed(2), c.key + (c.org ? ' (' + c.org + ')' : ''), ...orgs.map(o => (sp[o] || 0).toFixed(2))]; })); };
 }
+// huurprijs en indexatie (ter info) onderaan de afrekening – telt niet mee in de afrekening
+function rentInfo(o) {
+  const D = peil, lines = RENT.filter(r => r.org === o && r.from && (r.from <= D || r.from <= per.to) && (!r.to || r.to >= per.from));
+  if (!lines.length) return '';
+  const r2 = v => Math.round(v * 100) / 100, ix = v => Number(v).toLocaleString('nl-BE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  let tot = 0;
+  const rows = lines.map(r => {
+    const act = r.from <= D && (!r.to || r.to >= D), n = rentNow(r, D), now = r2(n.rent || 0); if (act) tot += now;
+    const lab = (r.note ? r.note.split(/[.;]/)[0] : 'Contract vanaf ' + dfmt(r.from)) + (Number(r.m2) ? ` (${String(r.m2).replace('.', ',')} m²)` : '');
+    const how = n.last ? (n.last.rent == null ? `index ${ymName(n.last.idxMonth)} ontbreekt nog` : `sinds ${dfmt(n.last.date)}: ${eur2(r.base)} × <b>${ix(n.last.idx)}</b> (index ${ymName(n.last.idxMonth)}) ÷ <b>${ix(rentBaseIdx(r))}</b> (startindex)`) : `basishuur sinds ${dfmt(r.from)}, nog niet geïndexeerd`;
+    const st = rentSteps(r, per.to <= D ? per.to : D).filter(s => s.date >= per.from && s.date <= per.to && s.rent != null);
+    const inP = st.length ? 'Indexatie in deze periode: ' + st.map(s => `${dfmt(s.date)} → ${eur2(r2(s.rent))}`).join(', ') : '';
+    const nx = act ? rentNext(r, D) : '', nxt = nx ? `Volgende indexatie: ${dfmt(nx)} (index ${ymName(prevYm(nx))})` : (r.to ? 'Contract beëindigd op ' + dfmt(r.to) : '');
+    return `<tr${act ? '' : ' style="opacity:.6"'}><td>${esc(lab)}<br><span class="sml">${how}</span>${inP ? `<br><span class="sml">${esc(inP)}</span>` : ''}${nxt ? `<br><span class="sml">${esc(nxt)}</span>` : ''}</td><td class="num">${act ? eur2(now) + ' / maand' : '–'}</td></tr>`;
+  }).join('');
+  return `<div class="rentbox" style="margin-top:16px;max-width:560px;border:1.5px solid #2f6f9f;border-left:6px solid #2f6f9f;border-radius:6px;background:#eef5fb;padding:10px 14px 6px;-webkit-print-color-adjust:exact;print-color-adjust:exact;break-inside:avoid">
+    <h2 style="margin:0 0 6px;color:#2f6f9f">Huurprijs en indexatie (ter info)</h2><table class="sum" style="width:100%;background:transparent"><tbody>${rows}</tbody>${lines.filter(r => r.from <= D && (!r.to || r.to >= D)).length > 1 ? `<tfoot><tr><th>Huidige huur per maand (${dfmt(D)})</th><th class="num">${eur2(r2(tot))}</th></tr></tfoot>` : ''}</table>
+    <p class="pf" style="margin-top:6px">Huur geïndexeerd volgens de gezondheidsindex, basis 2013 (Statbel): basishuur × nieuwe index ÷ oorspronkelijke index. Dit deel is enkel ter info en telt niet mee in de afrekening hierboven.</p></div>`;
+}
 // afrekening per organisatie: één pagina per organisatie, via afdrukken → "Opslaan als PDF"
 function orgPdf(sel) {
   PSC = {}; const cs = costsInPeriod(), vo = {};
@@ -514,6 +565,7 @@ function orgPdf(sel) {
       ${SIMKEY ? `<p><b>Simulatie</b> – alle kostenlijnen (behalve 'Rechtstreeks') berekend met "${esc(SIMKEY)}". Geen definitieve afrekening.</p>` : ''}
       <h2>Overzicht</h2><table class="sum"><tbody><tr><td>Aandeel in de kosten (incl. btw)</td><td class="num">${eur2(sh)}</td></tr><tr><td style="padding-left:16px;font-size:90%">waarvan btw</td><td class="num" style="font-size:90%">${eur2(vt)}</td></tr><tr><td>Betaalde voorschotten</td><td class="num">${v ? eur2(v) : '–'}</td></tr></tbody>
       <tfoot><tr><th>${sal > 0.005 ? 'Te betalen' : sal < -0.005 ? 'Terug te krijgen' : 'Saldo'}</th><th class="num">${eur2(Math.abs(sal))}</th></tr></tfoot></table>
+      ${rentInfo(o)}
       ${rows.length ? `<h2>Per categorie</h2><table class="sum"><tbody>${Object.entries(cat).map(([k, n]) => `<tr><td>${esc(k)}</td><td class="num">${eur2(n)}</td></tr>`).join('')}</tbody></table>
       <h2>Detail kostenposten</h2><table><thead><tr><th>Categorie</th><th>Omschrijving</th><th>Periode</th><th class="num">Bedrag</th><th>Verdeelsleutel</th><th class="num">Uw aandeel</th></tr></thead><tbody>` +
         rows.map(({ c, sh }) => `<tr><td>${esc(c.cat)}</td><td>${esc(c.desc)}${c.supplier || c.invoice ? `<br><span class="sml">${esc([c.supplier, c.invoice && 'factuur ' + c.invoice].filter(Boolean).join(' · '))}</span>` : ''}</td><td style="white-space:nowrap">${dfmt(ovl(c).A)} – ${dfmt(ovl(c).B)}</td><td class="num">${eur2(amtIn(c))}</td><td>${esc(SIMKEY && c.key !== KEYS[3] ? SIMKEY : c.key || KDEF)}</td><td class="num">${eur2(sh)}</td></tr>`).join('') +
@@ -577,12 +629,13 @@ function renderAfr() {
   }
   $('#tAfr').innerHTML = cs.length ? `<thead><tr><th>Categorie</th><th>Omschrijving</th><th>Periode</th><th class="num">Bedrag</th><th>Sleutel</th>${orgs.map(o => `<th class="num"><span class="swatch" style="background:${orgColor(o) || '#ddd'}"></span>${esc(o)}</th>`).join('')}<th></th></tr></thead><tbody>` +
     cs.map(c => { const sp = split(c); return `<tr data-id="${esc(c._id)}"><td>${canWrite ? `<select class="ce" data-f="cat">${[...new Set([...CATS, c.cat || ''])].filter(Boolean).map(x => `<option${x === c.cat ? ' selected' : ''}>${esc(x)}</option>`).join('')}</select>` : esc(c.cat)}</td><td class="wrap">${esc(c.desc)}${c.supplier || c.invoice || c.meter ? `<br><span class="empty" style="font-size:11px">${esc([c.supplier, c.invoice && 'factuur ' + c.invoice, c.entry && 'boekstuk ' + c.entry, c.gl, c.meter && 'meter ' + c.meter].filter(Boolean).join(' · '))}</span>` : ''}${c.cu && !/^huurpat$/i.test(c.cu) ? '<br><span class="imp-warn">⚠ geen HUURPAT in Exact</span>' : ''}</td>
-      <td class="mono" style="font-size:12px;white-space:nowrap">${canWrite ? `<input type="date" class="ce" data-f="from" value="${c.from || ''}"><br><input type="date" class="ce" data-f="to" value="${c.to || ''}">` : dfmt(c.from) + '<br>' + dfmt(c.to)}</td><td class="num mono">${eur2(amtIn(c))}<br><span class="empty" style="font-size:10px">excl. ${eur2(Number(c.amount) || 0)} + btw ${canWrite ? `<select class="ce" data-f="vat" style="font-size:10px;padding:0">${[0, 6, 21].map(v => `<option value="${v}"${v === (Number(c.vat) || 0) ? ' selected' : ''}>${v}%</option>`).join('')}</select>` : (Number(c.vat) || 0) + '%'} = ${eur2(amtIn(c) - (Number(c.amount) || 0) * ovl(c).f)}${ovl(c).f < 0.9999 ? ` · ${Math.round(ovl(c).f * 100)}%` : ''}</span></td><td style="font-size:12px">${canWrite ? `<select class="ce" data-f="key">${KEYS.map(k => `<option${k === (c.key || KDEF) ? ' selected' : ''}>${esc(k)}</option>`).join('')}</select>${c.key === KEYS[3] ? `<br><select class="ce" data-f="org">${ORGS.map(o => `<option${o.name === c.org ? ' selected' : ''}>${esc(o.name)}</option>`).join('')}</select>` : ''}` : esc(c.key) + (c.org ? '<br><b>' + esc(c.org) + '</b>' : '')}${SIMKEY && c.key !== KEYS[3] ? '<br><span class="imp-warn">simulatie: ' + esc(SIMKEY) + '</span>' : ''}</td>
+      <td class="mono" style="font-size:12px;white-space:nowrap">${canWrite ? `<input type="date" class="ce" data-f="from" value="${c.from || ''}"><br><input type="date" class="ce" data-f="to" value="${c.to || ''}">` : dfmt(c.from) + '<br>' + dfmt(c.to)}</td><td class="num mono">${eur2(amtIn(c))}<br><span class="empty" style="font-size:10px">excl. ${eur2(Number(c.amount) || 0)} + btw ${canWrite ? `<select class="ce" data-f="vat" style="font-size:10px;padding:0">${[0, 6, 21].map(v => `<option value="${v}"${v === (Number(c.vat) || 0) ? ' selected' : ''}>${v}%</option>`).join('')}</select>` : (Number(c.vat) || 0) + '%'} = ${eur2(amtIn(c) - (Number(c.amount) || 0) * ovl(c).f)}${ovl(c).f < 0.9999 ? ` · ${Math.round(ovl(c).f * 100)}%` : ''}</span></td><td style="font-size:12px">${canWrite ? `<select class="ce" data-f="key">${KEYS.map(k => `<option${k === (c.key || KDEF) ? ' selected' : ''}>${esc(k)}</option>`).join('')}</select>${c.key === KEYS[3] ? `<div style="margin-top:4px;line-height:1.5">${ORGS.map(o => `<label style="display:block;white-space:nowrap"><input type="checkbox" class="ce" data-f="orgs" value="${esc(o.name)}"${String(c.org || '').split(' + ').includes(o.name) ? ' checked' : ''}> ${esc(o.name)}</label>`).join('')}${String(c.org || '').includes(' + ') ? '<span class="empty" style="font-size:10px">verdeeld naar bezette m²</span>' : ''}</div>` : ''}` : esc(c.key) + (c.org ? '<br><b>' + esc(c.org) + '</b>' : '')}${SIMKEY && c.key !== KEYS[3] ? '<br><span class="imp-warn">simulatie: ' + esc(SIMKEY) + '</span>' : ''}</td>
       ${orgs.map(o => `<td class="num mono">${sp[o] ? eur2(sp[o]) : '–'}</td>`).join('')}<td>${canWrite ? '<button class="occdel cdel" title="Verwijderen">✕</button>' : ''}</td></tr>`; }).join('') +
     `</tbody><tfoot><tr><th colspan="3">Totaal</th><th class="num mono">${eur2(total)}</th><th></th>${orgs.map(o => `<th class="num mono">${eur2(tot[o] || 0)}</th>`).join('')}<th></th></tr></tfoot>` : '<tbody><tr><td class="empty">Nog geen kostenposten in deze periode. Voeg ze hierboven toe.</td></tr></tbody>';
   $('#tAfr').onchange = async e => {
     const el = e.target.closest('.ce'); if (!el) return; const tr = el.closest('tr'), c = COSTS.find(x => String(x._id) === tr.dataset.id); if (!c) return;
-    const f = el.dataset.f, patch = { _id: c._id, [f]: f === 'vat' ? Number(el.value) : el.value };
+    let f = el.dataset.f; const patch = { _id: c._id, [f]: f === 'vat' ? Number(el.value) : el.value };
+    if (f === 'orgs') { delete patch.orgs; f = 'org'; patch.org = [...tr.querySelectorAll('input[data-f="orgs"]:checked')].map(x => x.value).join(' + '); if (!patch.org) { setStatus('ro', 'Kies minstens één organisatie'); renderAfr(); return; } }
     if (f === 'key') { patch.org = el.value === KEYS[3] ? (c.org || 'De Overmolen') : ''; }
     if (f === 'cat') { /* enkel categorie */ }
     if ((f === 'from' && el.value > (c.to || '9')) || (f === 'to' && el.value < (c.from || '0'))) { setStatus('ro', "'Tot' ligt vóór 'Van' – niet opgeslagen"); renderAfr(); return; }
@@ -678,6 +731,9 @@ function catKey(gl, desc, rel) {
 // ---------- slim importeren: HUURPAT, geleerde keuzes, ontbrekende voorschotten
 const OWNER_RE = /\bepb\b|schilder|verfwerk|\bgsm\b|smartphone|huurvermindering|renovatie|investering/i;
 let RULES = {}, RULES_ID = null;
+// lijnen die je bij een vorige import NIET in de afrekening nam: worden bij een volgende import niet opnieuw als 'nieuw' getoond
+let IGN = new Set(), IGN_ID = null;
+const ignKey = u => String(u || '').replace(/^EX:/, '');
 const ruleKey = c => { const s = String(c.supplier || '').toLowerCase().replace(/\b(nv|bv|sa|srl|bvba|vzw|n\.v\.|s\.a\.)\b/g, '').replace(/[^a-z]/g, '').slice(0, 30); return (s || String(c.desc || '').toLowerCase().replace(/[^a-z]/g, '').slice(0, 30)) + '|' + String(c.gl || '').slice(0, 4); };
 function applyRules(costs) {
   for (const c of costs) { const r = RULES[ruleKey(c)]; if (!r) continue;
@@ -755,11 +811,11 @@ function parseExact(text) {
   return { lines, costs, vos, info, from: dates[0], to: dates[dates.length - 1], cc: [...new Set(lines.map(l => l.cc).filter(Boolean))] };
 }
 function diffImport(P) {
-  const R = { cAdd: [], cSame: [], cChg: [], cDel: [], vAdd: [], vSame: [], vChg: [], vDel: [] };
+  const R = { cAdd: [], cIgn: [], cSame: [], cChg: [], cDel: [], vAdd: [], vSame: [], vChg: [], vDel: [] };
   const inR = d => d && d >= P.from && d <= P.to;
   const ec = new Map(COSTS.filter(c => c.uid).map(c => [c.uid, c])), seenC = new Set();
   for (const c of P.costs) { seenC.add(c.uid); const o = ec.get(c.uid);
-    if (!o) R.cAdd.push(c); else if (Math.abs((Number(o.amount) || 0) - c.amount) > 0.004 || (o.desc || '') !== c.desc || (o.supplier || '') !== c.supplier || (o.vat === '' || o.vat == null) && c.vat) R.cChg.push({ n: c, o, on: true }); else R.cSame.push(c); }
+    if (!o && IGN.has(ignKey(c.uid))) R.cIgn.push(c); else if (!o) R.cAdd.push(c); else if (Math.abs((Number(o.amount) || 0) - c.amount) > 0.004 || (o.desc || '') !== c.desc || (o.supplier || '') !== c.supplier || (o.vat === '' || o.vat == null) && c.vat) R.cChg.push({ n: c, o, on: true }); else R.cSame.push(c); }
   // enkel als het bestand zelf kostenlijnen bevat; nooit standaard aangevinkt (gebruiker beslist)
   if (P.costs.length) for (const o of COSTS) if (o.src === 'Exact' && o.uid && !seenC.has(o.uid) && inR(o.bdate)) R.cDel.push({ o, on: false });
   const ev = new Map(VOS.filter(v => v.uid).map(v => [v.uid, v])), seenV = new Set();
@@ -776,7 +832,7 @@ function bindImport() {
   $('#aImpFile').onchange = async e => {
     const f = e.target.files[0]; e.target.value = ''; if (!f) return;
     const box = $('#afrImp'); box.hidden = false; box.innerHTML = '<p>Bestand lezen…</p>';
-    try { const P = parseExact(decodeFile(await f.arrayBuffer())); applyRules(P.costs); IMP = { file: f, P, R: diffImport(P), learned: {} }; renderImport(); }
+    try { const P = parseExact(decodeFile(await f.arrayBuffer())); applyRules(P.costs); const R = diffImport(P); R.cAdd.forEach(c => { c.hid = c.on === false; }); IMP = { file: f, P, R, learned: {} }; renderImport(); }
     catch (er) { box.innerHTML = `<div class="occbox"><b class="err">Import mislukt:</b> ${esc(er.message)} <button class="btn" id="impX">Sluiten</button></div>`; $('#impX').onclick = () => { box.hidden = true; }; }
   };
 }
@@ -808,8 +864,8 @@ function renderImport() {
     <div class="imp-head"><b>Import Exact: ${esc(file.name)}</b> <span class="chip">${P.lines.length} lijnen</span> <span class="chip">boekdatum ${dfmt(P.from)} – ${dfmt(P.to)}</span>${P.cc.length ? `<span class="chip">kostenplaats: ${esc(P.cc.join(', '))}</span>` : ''}</div>
     <div class="cards imp-cards">
       <div class="card"><span class="k">Kosten (6xxxxx)</span><span class="v">${eur2(sum(P.costs))}</span><span class="k">${P.costs.length} lijnen</span></div>
-      <div class="card"><span class="k">Kosten nieuw</span><span class="v">${R.cAdd.length}</span><span class="k">${eur2(sum(R.cAdd))}</span></div>
-      <div class="card"><span class="k">Al aanwezig</span><span class="v">${R.cSame.length + R.vSame.length}</span><span class="k">ongewijzigd, overgeslagen</span></div>
+      <div class="card"><span class="k">Huurderslasten nieuw</span><span class="v">${R.cAdd.filter(c => !c.hid).length}</span><span class="k">${eur2(sum(R.cAdd.filter(c => !c.hid)))}${R.cAdd.some(c => c.hid) ? ` · ${R.cAdd.filter(c => c.hid).length} eigenaarskosten verborgen` : ''}</span></div>
+      <div class="card"><span class="k">Al aanwezig</span><span class="v">${R.cSame.length + R.vSame.length}</span><span class="k">ongewijzigd, overgeslagen${R.cIgn.length ? ` · ${R.cIgn.length} eerder niet opgenomen` : ''}</span></div>
       <div class="card ${R.cChg.length + R.vChg.length ? 'warnc' : ''}"><span class="k">Gewijzigd in Exact</span><span class="v">${R.cChg.length + R.vChg.length}</span></div>
       <div class="card ${R.cDel.length + R.vDel.length ? 'badc' : ''}"><span class="k">Niet meer in Exact</span><span class="v">${R.cDel.length + R.vDel.length}</span></div>
       <div class="card"><span class="k">Voorschotten (702000 · HUUR)</span><span class="v">${eur2(sum(P.vos))}</span><span class="k">${P.vos.length} lijnen · ${R.vAdd.length} nieuw</span></div>
@@ -818,8 +874,11 @@ function renderImport() {
     ${unmapped.length ? `<div class="imp-map"><b class="imp-warn">Koppel deze huurders aan een organisatie:</b>${unmapped.map(n => `<label>${esc(n)} → <select class="imap" data-n="${esc(n)}"><option value="">– kies –</option>${opt(orgNames, '')}</select></label>`).join('')}</div>` : ''}
     ${R.cChg.length ? `<h3>Gewijzigd in Exact (${R.cChg.length})</h3><div class="tscroll"><table class="imp-t"><thead><tr><th>Bijwerken</th><th>Boekstuk</th><th>Omschrijving</th><th class="num">Oud</th><th class="num">Nieuw</th></tr></thead><tbody>${R.cChg.map((x, i) => `<tr class="chg" data-i="${i}" data-k="cChg"><td><input type="checkbox" class="ion" ${x.on ? 'checked' : ''}></td><td class="mono">${esc(x.n.entry)}</td><td class="wrap">${esc(x.o.desc)}${x.o.desc !== x.n.desc ? '<br>→ ' + esc(x.n.desc) : ''}</td><td class="num mono">${eur2(Number(x.o.amount) || 0)}</td><td class="num mono">${eur2(x.n.amount)}</td></tr>`).join('')}</tbody></table></div><p class="empty" style="font-size:12px">Bij bijwerken veranderen enkel bedrag, omschrijving, leverancier en grootboek. Jouw categorie, sleutel en periode blijven.</p>` : ''}
     ${R.cDel.length ? `<h3>Niet meer in Exact (${R.cDel.length})</h3><div class="tscroll"><table class="imp-t"><thead><tr><th>Verwijderen</th><th>Boekstuk</th><th>Omschrijving</th><th class="num">Bedrag</th></tr></thead><tbody>${R.cDel.map((x, i) => `<tr class="del" data-i="${i}" data-k="cDel"><td><input type="checkbox" class="ion" ${x.on ? 'checked' : ''}></td><td class="mono">${esc(x.o.entry)}</td><td class="wrap">${esc(x.o.desc)}</td><td class="num mono">${eur2(Number(x.o.amount) || 0)}</td></tr>`).join('')}</tbody></table></div>` : ''}
-    ${R.cAdd.length ? `<h3>Nieuwe kosten (${R.cAdd.length}) <span class="empty" style="font-size:12px;font-weight:400">– controleer categorie, sleutel en periode; vinkje uit = niet importeren</span></h3>
-      <div class="tscroll imp-scroll"><table class="imp-t"><thead><tr><th></th><th>Boekdatum / stuk</th><th>Omschrijving</th><th class="num">Bedrag</th><th>Categorie</th><th>Sleutel</th><th>Periode</th></tr></thead><tbody>${R.cAdd.map((c, i) => cRow(c, i, 'cAdd')).join('')}</tbody></table></div>` : ''}
+    ${R.cAdd.length ? `<h3>Nieuwe huurderslasten (${R.cAdd.filter(c => !c.hid).length}) <span class="empty" style="font-size:12px;font-weight:400">– controleer categorie, sleutel en periode; vinkje uit = niet importeren</span></h3>
+      <div class="tscroll imp-scroll"><table class="imp-t"><thead><tr><th></th><th>Boekdatum / stuk</th><th>Omschrijving</th><th class="num">Bedrag</th><th>Categorie</th><th>Sleutel</th><th>Periode</th></tr></thead><tbody>${R.cAdd.map((c, i) => c.hid ? '' : cRow(c, i, 'cAdd')).join('') || '<tr><td colspan="7" class="empty">Geen nieuwe huurderslasten.</td></tr>'}</tbody></table></div>
+      ${R.cAdd.some(c => c.hid) ? `<details class="imp-hid" style="margin-top:8px"><summary><b>${R.cAdd.filter(c => c.hid).length} eigenaarskosten / lijnen zonder HUURPAT</b> (${eur2(sum(R.cAdd.filter(c => c.hid)))}) – verborgen, niet in afrekening. <span class="empty">Klik om te tonen; vink aan om toch mee te nemen.</span></summary>
+        <div class="tscroll imp-scroll"><table class="imp-t"><tbody>${R.cAdd.map((c, i) => c.hid ? cRow(c, i, 'cAdd') : '').join('')}</tbody></table></div></details>` : ''}` : ''}
+    ${R.cIgn.length ? `<details style="margin-top:8px"><summary>${R.cIgn.length} lijnen die je bij een vorige import niet opnam (${eur2(sum(R.cIgn))}) – overgeslagen</summary><p style="font-size:13px;margin:6px 0">Deze lijnen blijven buiten de afrekening. <button class="btn" id="impIgn">Toch tonen om te kiezen</button></p></details>` : ''}
     ${P.vos.length ? `<h3>Voorschotten per organisatie (in dit bestand)</h3><ul class="mini imp-vo">${Object.entries(vByOrg).sort((a, b) => b[1] - a[1]).map(([k, v]) => `<li><span>${esc(k)}</span><span class="mono">${eur2(v)}</span></li>`).join('')}</ul>` : ''}
     ${infoRows ? `<details style="margin-top:10px"><summary>Niet geïmporteerd (ter info): huur, vorige afrekening, balansrekeningen</summary><ul class="mini" style="margin-top:6px">${infoRows}</ul></details>` : ''}
     <div class="btns" style="margin-top:12px"><button class="btn primary" id="impGo">Opslaan in SharePoint</button><button class="btn" id="impX">Annuleren</button><span id="impMsg"></span></div>
@@ -840,6 +899,7 @@ function renderImport() {
     if (t.classList.contains('ito')) c.to = t.value;
   };
   $('#impX').onclick = () => { IMP = null; renderImport(); };
+  if ($('#impIgn')) $('#impIgn').onclick = () => { R.cIgn.forEach(c => { c.hid = true; c.on = false; R.cAdd.push(c); }); R.cIgn = []; renderImport(); };
   $('#impGo').onclick = () => saveImport();
 }
 async function saveImport() {
@@ -847,7 +907,7 @@ async function saveImport() {
   if (P.vos.some(v => !v.org)) { msg.className = 'err'; msg.textContent = 'Koppel eerst alle huurders aan een organisatie.'; return; }
   if (R.cAdd.some(c => c.on && c.from > c.to)) { msg.className = 'err'; msg.textContent = "Een periode heeft 'Tot' vóór 'Van'."; return; }
   const ops = [];
-  for (const c of R.cAdd) if (c.on) { const o = { ...c }; delete o.on; delete o.psrc; delete o.warn; delete o.learned; delete o.vsrc; if (o.key !== KEYS[3]) o.org = ''; ops.push({ kind: 'costs', op: 'add', obj: o }); }
+  for (const c of R.cAdd) if (c.on) { const o = { ...c }; delete o.on; delete o.psrc; delete o.warn; delete o.learned; delete o.vsrc; delete o.hid; if (o.key !== KEYS[3]) o.org = ''; ops.push({ kind: 'costs', op: 'add', obj: o }); }
   for (const x of R.cChg) if (x.on) ops.push({ kind: 'costs', op: 'upd', obj: { _id: x.o._id, vat: (x.o.vat === '' || x.o.vat == null) ? x.n.vat : Number(x.o.vat), amount: x.n.amount, desc: x.n.desc, supplier: x.n.supplier, gl: x.n.gl, entry: x.n.entry, bdate: x.n.bdate } });
   for (const x of R.cDel) if (x.on) ops.push({ kind: 'costs', op: 'del', obj: { _id: x.o._id } });
   for (const v of R.vAdd) ops.push({ kind: 'vo', op: 'add', obj: v });
@@ -863,6 +923,8 @@ async function saveImport() {
     const n = k => ops.filter(o => o.op === k).length;
     try { await LK.save('imp', { file: file.name, at: new Date().toLocaleString('nl-BE'), from: P.from, to: P.to, lines: P.lines.length, added: n('add'), changed: n('upd'), removed: n('del'), who: $('#who').textContent, note }); } catch (er) { note += ' · log niet bewaard: ' + er.message; }
     if (Object.keys(IMP.learned || {}).length) { for (const { c, ch } of Object.values(IMP.learned)) learn(c, ch); await saveRules(); }
+    { let chg = false; for (const c of R.cAdd) { const k = ignKey(c.uid); if (!k) continue; if (c.on === false && !IGN.has(k)) { IGN.add(k); chg = true; } else if (c.on !== false && IGN.delete(k)) chg = true; }
+      if (chg) { const o = { key: 'genegeerd', rules: JSON.stringify([...IGN]) }; if (IGN_ID) o._id = IGN_ID; try { await LK.save('settings', o); IGN_ID = o._id; } catch (er) { note += ' · niet-opgenomen lijnen niet onthouden: ' + er.message; } } }
     await reload(); IMP = null; renderAll(true);
     setStatus('live', `Import klaar: ${n('add')} nieuw · ${n('upd')} bijgewerkt · ${n('del')} verwijderd`);
     const box = $('#afrImp'); box.hidden = false; box.innerHTML = `<div class="occbox"><b class="saved">✓ Import opgeslagen</b> – ${n('add')} nieuw · ${n('upd')} bijgewerkt · ${n('del')} verwijderd. <span class="empty">${esc(note)}</span> <button class="btn" id="impX">Sluiten</button></div>`;
@@ -870,9 +932,196 @@ async function saveImport() {
   } catch (er) { btn.disabled = false; msg.className = 'err'; msg.textContent = 'Niet (volledig) opgeslagen: ' + (er.status === 403 ? 'geen bewerkrechten.' : er.message) + ' Herlaad en importeer opnieuw: wat al bewaard is wordt herkend.'; }
 }
 let raf = 0;
+// ---------- Huur & index (huurprijs en indexatie, gezondheidsindex basis 2013 – Statbel)
+let RENT = [], IDX = {};
+const ym = d => d.slice(0, 7);
+const prevYm = s => { let y = +s.slice(0, 4), m = +s.slice(5, 7) - 1; if (!m) { y--; m = 12; } return y + '-' + String(m).padStart(2, '0'); };
+const MONTHS = ['januari', 'februari', 'maart', 'april', 'mei', 'juni', 'juli', 'augustus', 'september', 'oktober', 'november', 'december'];
+const ymName = s => MONTHS[+s.slice(5, 7) - 1] + ' ' + s.slice(0, 4);
+const fmtIdx = v => v == null || v === '' ? '?' : Number(v).toLocaleString('nl-BE', { minimumFractionDigits: 2 });
+// basisindex: ingevuld, anders index van de maand vóór 'Van'
+const rentBaseIdx = r => (r.baseIdx !== '' && r.baseIdx != null) ? Number(r.baseIdx) : IDX[prevYm(r.from)];
+// addendum ('Addendum bij' = hoofdcontract): wordt samen met het hoofdcontract geïndexeerd, in dezelfde maand
+const rentPar = r => r && r.parent ? RENT.find(x => x !== r && String(x._id) === String(r.parent) && !x.parent) || null : null;
+const rentIdxMonth = r => { const p = rentPar(r) || r; return Number(p.idxMonth) || +(p.from || r.from).slice(5, 7); };
+// alle indexaties van een contractlijn tot datum D: elke verjaardag (1e van de indexmaand) na 'Van'
+function rentSteps(r, D) {
+  const out = [], bi = rentBaseIdx(r), m = rentIdxMonth(r); if (!r.from) return out;
+  for (let y = +r.from.slice(0, 4); y <= +D.slice(0, 4); y++) {
+    const A = isoD(y, m, 1); if (A <= r.from || A > D || (r.to && A > r.to)) continue;
+    const im = prevYm(A), iv = IDX[im];
+    out.push({ date: A, idxMonth: im, idx: iv, rent: iv && bi ? Number(r.base) * iv / bi : null });
+  }
+  return out;
+}
+function rentNow(r, D) {
+  const st = rentSteps(r, D), last = st[st.length - 1];
+  return { last, rent: last ? last.rent : Number(r.base) || 0, missing: last && last.rent == null };
+}
+function rentNext(r, D) {
+  const m = rentIdxMonth(r); let y = +D.slice(0, 4); let A = isoD(y, m, 1); if (A <= D) A = isoD(y + 1, m, 1);
+  if (A <= r.from) A = isoD(+r.from.slice(0, 4) + 1, m, 1);
+  return A;
+}
+// ---------- Indexatiebrief (PDF + Outlook-concept)
+function letterData(org, D, today) {
+  const lines = RENT.filter(r => r.org === org && r.from && r.from <= D && (!r.to || r.to >= D));
+  let A = ''; lines.forEach(r => { const n = rentNow(r, D); if (n.last && n.last.date > A) A = n.last.date; });
+  if (!A) return null;
+  const rows = lines.map(r => {
+    const st = rentSteps(r, D), i = st.findIndex(s => s.date === A), s = st[i];
+    if (!s) return { r, changed: false, now: rentNow(r, D).rent };
+    return { r, changed: true, s, bi: rentBaseIdx(r), old: i > 0 ? st[i - 1].rent : Number(r.base), now: s.rent };
+  });
+  if (rows.some(x => x.changed && x.now == null)) return { org, A, missing: true };
+  const r2 = v => Math.round(v * 100) / 100;
+  const total = r2(rows.reduce((s, x) => s + r2(x.now || 0), 0));
+  const diffM = r2(rows.filter(x => x.changed).reduce((s, x) => s + r2(x.now) - r2(x.old), 0));
+  const t = today || ymd(new Date());
+  const nM = Math.max(0, (+t.slice(0, 4) - +A.slice(0, 4)) * 12 + (+t.slice(5, 7) - +A.slice(5, 7)) + 1);
+  const email = (lines.find(x => x.email) || {}).email || '';
+  return { org, A, rows, total, diffM, nM, diffTot: r2(diffM * nM), email, today: t };
+}
+function letterPdf(L) {
+  const doc = new window.jspdf.jsPDF({ unit: 'mm', format: 'a4' });
+  const e = v => '€ ' + Number(v).toLocaleString('nl-BE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const ix = v => Number(v).toLocaleString('nl-BE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  let y = 22; const X = 22, W = 166;
+  const p = (s, o = {}) => { doc.setFont('helvetica', o.b ? 'bold' : 'normal'); doc.setFontSize(o.s || 11); const ls = doc.splitTextToSize(s, o.w || W); doc.text(ls, o.x || X, y, o.r ? { align: 'right' } : undefined); y += ls.length * (o.lh || 5.4); };
+  p('VZW De Overmolen', { b: 1, s: 13 }); p('Boekhouding', { s: 10 });
+  y = 55; const ad = ['Passerstraat 5-7-9', '1070 Anderlecht']; p(L.org, { b: 1, x: 118, w: 70 }); ad.forEach(a => p(a, { x: 118, w: 70 }));
+  y = 85; p('Brussel, ' + dfmt(L.today));
+  y += 6; p('Betreft: indexatie huurprijs – ' + ymName(L.A.slice(0, 7)), { b: 1 });
+  y += 4; p('Geachte,');
+  y += 2; p(`Vanaf ${ymName(L.A.slice(0, 7))} werd de huur aangepast aan de nieuwe index. Deze aanpassing werd berekend volgens onderstaande formule (gezondheidsindex, basis 2013):`);
+  y += 2; p('Basishuurprijs × nieuwe index ÷ oorspronkelijke index', { b: 1 });
+  y += 3;
+  L.rows.filter(x => x.changed).forEach(x => {
+    if (L.rows.length > 1) p((x.r.note ? x.r.note : 'Contract vanaf ' + dfmt(x.r.from)) + (Number(x.r.m2) ? ` (${String(x.r.m2).replace('.', ',')} m2)` : ''), { s: 10 });
+    p(`${e(x.r.base)} × ${ix(x.s.idx)} (${ymName(x.s.idxMonth)}) ÷ ${ix(x.bi)} = ${e(x.now)} per maand`, { b: 1, x: X + 6 });
+    p(`Vorige huur: ${e(x.old)} per maand`, { s: 10, x: X + 6 }); y += 2;
+  });
+  L.rows.filter(x => !x.changed).forEach(x => { p(`${x.r.note || 'Contract vanaf ' + dfmt(x.r.from)}: ongewijzigd ${e(x.now)} per maand`, { s: 10 }); y += 1; });
+  y += 1; doc.setDrawColor(150); doc.line(X, y, X + W, y); y += 6;
+  p(`Nieuwe huur per maand: ${e(L.total)}`, { b: 1 });
+  if (L.nM > 0 && L.diffM > 0) p(`Verschil per maand: ${e(L.diffM)} – voor ${L.nM} maand(en) (${ymName(L.A.slice(0, 7))} t.e.m. ${ymName(L.today.slice(0, 7))}): ${e(L.diffTot)}`, { s: 10 });
+  y += 5; p('Gelieve Uw bestendige opdracht aan te passen aan de nieuwe huur, en het verschil van de vorige maand(en) apart over te schrijven.');
+  y += 3; p('Rekeningnummer IBAN: BE92 0682 4007 4623'); p('BTW-nr: BE 0447.508.015');
+  y += 8; p('Met vriendelijke groeten,'); y += 10; p('Boekhouding VZW De Overmolen', { b: 1 });
+  return doc;
+}
+async function sendLetter(org, btn) {
+  const L = letterData(org, peil);
+  if (!L) { setStatus('ro', org + ': nog geen indexatie vóór ' + dfmt(peil)); return; }
+  if (L.missing) { setStatus('ro', org + ': index ontbreekt – vul eerst de index in'); return; }
+  btn.disabled = true; const old = btn.textContent; btn.textContent = '…';
+  try {
+    if (!window.jspdf) await new Promise((ok, no) => { const s = document.createElement('script'); s.src = 'https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js'; s.onload = ok; s.onerror = () => no(new Error('PDF-bibliotheek niet geladen')); document.head.appendChild(s); });
+    const doc = letterPdf(L), name = `Indexatie huur ${org} ${L.A.slice(0, 7)}.pdf`.replace(/[\\/:*?"<>|]/g, '-');
+    const b64 = doc.output('datauristring').split(',')[1];
+    const e = v => '€ ' + Number(v).toLocaleString('nl-BE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const html = `<p>Geachte,</p><p>In bijlage vindt u de brief over de indexatie van de huur vanaf ${ymName(L.A.slice(0, 7))}.</p><p>Nieuwe huur per maand: <b>${e(L.total)}</b>.</p><p>Gelieve uw bestendige opdracht aan te passen en het verschil van de vorige maand(en) apart over te schrijven op BE92 0682 4007 4623.</p><p>Met vriendelijke groeten,<br>Boekhouding VZW De Overmolen</p>`;
+    let m;
+    try { m = await LK.mailDraft({ to: L.email, subject: `Indexatie huur ${org} – ${ymName(L.A.slice(0, 7))}`, html, att: [{ name, b64 }] }); }
+    catch (er) { doc.save(name); throw new Error('Outlook-concept niet gemaakt (' + er.message + '). De PDF is gedownload.'); }
+    if (m && m.webLink) window.open(m.webLink, '_blank', 'noopener');
+    setStatus('live', 'Concept in Outlook gemaakt voor ' + org + (L.email ? '' : ' – vul nog het e-mailadres in'));
+  } catch (er) { setStatus('ro', er.message); }
+  finally { btn.disabled = false; btn.textContent = old; }
+}
+function renderHuur() {
+  if (!$('#tHuur')) return;
+  const D = peil, act = RENT.filter(r => r.org && r.from && r.from <= D && (!r.to || r.to >= D));
+  const tot = act.reduce((s, r) => s + (rentNow(r, D).rent || 0), 0);
+  const soon = RENT.filter(r => r.org && (!r.to || r.to >= D)).map(r => ({ r, A: rentNext(r, D) })).filter(x => (new Date(x.A) - new Date(D)) / 864e5 <= 62);
+  const lastIdx = Object.keys(IDX).sort().pop();
+  $('#huurCards').innerHTML = `
+    <div class="card"><span class="k">Huur per maand (peildatum ${dfmt(D)})</span><span class="v">${eur2(tot)}</span><span class="k">${act.length} lopende contractlijnen</span></div>
+    <div class="card"><span class="k">Laatste index (Statbel, basis 2013)</span><span class="v">${lastIdx ? fmtIdx(IDX[lastIdx]) : '–'}</span><span class="k">${lastIdx ? ymName(lastIdx) : 'nog geen index'} · bron: Statbel (gezondheidsindex)</span></div>
+    ${(() => { const need = prevYm(ymd(new Date())); return IDX[need] ? '' : `<div class="card" style="border-color:var(--warn)"><span class="k">⚠ Index ontbreekt</span><span class="v" style="font-size:18px">${ymName(need)}</span><span class="k">Statbel publiceert de index eind van de maand. Zoek de gezondheidsindex (basis 2013) op en vul hem onderaan in. <a href="https://statbel.fgov.be/nl/themas/consumptieprijsindex/gezondheidsindex" target="_blank" rel="noopener">Statbel openen</a></span></div>`; })()}
+    <div class="card"><span class="k">Indexatie binnen 2 maanden</span><span class="v">${soon.length}</span><span class="k">${soon.map(x => esc(x.r.org) + ' – ' + dfmt(x.A) + (IDX[prevYm(x.A)] ? '' : ' <span class="err">(index ' + ymName(prevYm(x.A)) + ' nodig)</span>')).join('<br>') || '–'}</span></div>`;
+  const orgOpt = sel => ORGS.filter(o => o.type !== 'Eigenaar').map(o => `<option${o.name === sel ? ' selected' : ''}>${esc(o.name)}</option>`).join('');
+  const byFrom = (a, b) => (a.from || '').localeCompare(b.from || '');
+  const mains = RENT.filter(r => !rentPar(r)).sort((a, b) => a.org.localeCompare(b.org) || byFrom(a, b)), rows = [];
+  mains.forEach(m => { rows.push(m); RENT.filter(x => rentPar(x) === m).sort(byFrom).forEach(x => rows.push(x)); });
+  const isOn = r => r.from && r.from <= D && (!r.to || r.to >= D);
+  const lastOf = {}; rows.forEach((r, i) => { lastOf[r.org] = i; });
+  const subRow = org => { const ls = rows.filter(r => r.org === org && isOn(r)); if (ls.length < 2) return '';
+    const t = ls.reduce((s, r) => s + Math.round((rentNow(r, D).rent || 0) * 100) / 100, 0), m2 = ls.reduce((s, r) => s + (Number(r.m2) || 0), 0);
+    return `<tr class="hsub" style="background:var(--paper2,#f4f3ef)"><td colspan="7" style="text-align:right"><b>Totaal ${esc(org)}</b> <span class="empty">(${ls.length} lopende lijnen)</span></td><td class="num mono"><b>${eur2(t)}</b></td><td></td><td class="num mono">${m2 ? String(Math.round(m2 * 100) / 100).replace('.', ',') : ''}</td><td class="num mono">${m2 ? eur2(t * 12 / m2) : '–'}</td><td></td></tr>`; };
+  const parSel = r => { const ms = mains.filter(m => m !== r && m.org === r.org); if (!canWrite || (!ms.length && !rentPar(r))) return '';
+    return `<br><label style="font-size:11px">Addendum bij <select class="he" data-f="parent" style="font-size:11px;max-width:190px"><option value="">— (hoofdcontract)</option>${ms.map(m => `<option value="${m._id}"${String(r.parent) === String(m._id) ? ' selected' : ''}>${esc((m.note ? m.note.split(/[.;:]/)[0] : 'Contract') + ' · vanaf ' + dfmt(m.from))}</option>`).join('')}</select></label>`; };
+  const inp = (r, f, v, w, t) => canWrite ? `<input class="he" data-f="${f}" ${t ? `type="${t}"` : 'inputmode="decimal"'} value="${esc(v ?? '')}" style="width:${w}px">` : esc(v ?? '');
+  const firstOf = new Set();
+  $('#tHuur').innerHTML = `<thead><tr><th>Organisatie</th><th>Van</th><th>Tot</th><th class="num">Basishuur / maand</th><th class="num">Basisindex</th><th>Indexatie in</th><th>Laatste indexatie</th><th class="num">Huur nu / maand</th><th>Volgende</th><th class="num">m² contract</th><th class="num">€/m² per jaar</th><th></th></tr></thead><tbody>` +
+    (rows.map((r, ri) => {
+      const par = rentPar(r), bi = rentBaseIdx(r), n = rentNow(r, D), nx = rentNext(r, D), steps = rentSteps(r, D), on = r.from <= D && (!r.to || r.to >= D);
+      const hist = steps.filter(s => s.date >= '2025-01-01').map(s => `${dfmt(s.date)}: ${eur2(Number(r.base))} × ${fmtIdx(s.idx)} ÷ ${fmtIdx(bi)} = <b>${s.rent == null ? '? (index ' + ymName(s.idxMonth) + ' ontbreekt)' : eur2(s.rent)}</b>`).join('<br>');
+      return `<tr data-id="${r._id}"${on ? '' : ' style="opacity:.55"'}><td${par ? ' style="padding-left:22px"' : ''}>${par ? '<span class="empty">↳ addendum · </span>' : ''}<span class="swatch" style="background:${orgColor(r.org) || '#ddd'}"></span>${esc(r.org)}${r.note ? `<br><span class="empty" style="font-size:11px">${esc(r.note)}</span>` : ''}${canWrite && on ? `<br><input class="he" data-f="email" type="email" placeholder="e-mail huurder" value="${esc(r.email || '')}" style="width:170px;font-size:11px">${firstOf.has(r.org) ? '' : (firstOf.add(r.org), ' <button class="btn hbrief" style="font-size:11px" title="Indexatiebrief als PDF in een Outlook-concept">✉ Brief</button>')}` : ''}${parSel(r)}</td>
+      <td>${inp(r, 'from', r.from, 125, 'date')}</td><td>${inp(r, 'to', r.to, 125, 'date')}</td>
+      <td class="num mono">${inp(r, 'base', r.base, 90)}</td>
+      <td class="num mono">${inp(r, 'baseIdx', r.baseIdx, 60)}<br><span class="empty" style="font-size:10px">${r.baseIdx === '' || r.baseIdx == null ? (bi ? 'auto: ' + fmtIdx(bi) + ' (' + ymName(prevYm(r.from)) + ')' : '⚠ index ' + ymName(prevYm(r.from)) + ' ontbreekt') : ''}</span></td>
+      <td>${par ? `${MONTHS[rentIdxMonth(r) - 1]}<br><span class="empty" style="font-size:10px">zoals hoofdcontract</span>` : canWrite ? `<select class="he" data-f="idxMonth">${MONTHS.map((mn, i) => `<option value="${i + 1}"${i + 1 === rentIdxMonth(r) ? ' selected' : ''}>${mn}</option>`).join('')}</select>` : MONTHS[rentIdxMonth(r) - 1]}</td>
+      <td class="mono" style="font-size:12px">${n.last ? dfmt(n.last.date) + '<br>index ' + ymName(n.last.idxMonth) + ': ' + fmtIdx(n.last.idx) : '<span class="empty">nog geen</span>'}</td>
+      <td class="num mono"><b>${n.missing ? '<span class="err">index ontbreekt</span>' : eur2(n.rent)}</b>${hist ? `<details style="font-size:11px;text-align:left"><summary>historiek</summary>${hist}</details>` : ''}</td>
+      <td class="mono" style="font-size:12px">${dfmt(nx)}<br><span class="empty">index ${ymName(prevYm(nx))}${IDX[prevYm(nx)] ? ': ' + fmtIdx(IDX[prevYm(nx)]) : ''}</span></td>
+      <td class="num mono">${inp(r, 'm2', r.m2, 60)}</td>
+      <td class="num mono">${Number(r.m2) > 0 ? eur2(n.rent * 12 / Number(r.m2)) : '–'}</td>
+      <td>${canWrite ? '<button class="occdel hdel" title="Verwijderen">✕</button>' : ''}</td></tr>` + (lastOf[r.org] === ri ? subRow(r.org) : '');
+    }).join('') || '<tr><td colspan="12" class="empty">Nog geen contracten. Voeg ze hierboven toe: basishuur + datum vanaf wanneer die geldt (begin contract, of de huur op 01/01/2025).</td></tr>') + '</tbody>';
+  $('#huurNew').innerHTML = canWrite ? `<b>Nieuwe contractlijn</b>
+    <select id="hOrg">${orgOpt('')}</select>
+    <label>Addendum bij <select id="hPar"><option value="">— (nieuw hoofdcontract)</option>${mains.filter(m => !m.to || m.to >= D).map(m => `<option value="${m._id}">${esc(m.org + ' · ' + (m.note ? m.note.split(/[.;:]/)[0] : 'contract') + ' · vanaf ' + dfmt(m.from))}</option>`).join('')}</select></label>
+    <label>Van <input type="date" id="hFrom" value="2025-01-01"></label>
+    <input id="hBase" placeholder="Basishuur € / maand" inputmode="decimal" style="width:150px">
+    <input id="hIdx" placeholder="Basisindex (leeg = auto)" inputmode="decimal" style="width:170px">
+    <label>Indexatie in <select id="hMon">${MONTHS.map((mn, i) => `<option value="${i + 1}">${mn}</option>`).join('')}</select></label>
+    <input id="hM2" placeholder="m² contract" inputmode="decimal" style="width:100px">
+    <input id="hNote" placeholder="Opmerking (bv. addendum 2025)" style="width:200px">
+    <button class="btn primary" id="hAdd">Toevoegen</button><span id="hMsg"></span>` : '';
+  const num = v => { const s = String(v ?? '').replace(/\s/g, '').replace(/\.(?=\d{3}(\D|$))/g, '').replace(',', '.'); return s === '' ? null : Number(s); };
+  if (canWrite) $('#hPar').onchange = () => { const m = RENT.find(x => String(x._id) === $('#hPar').value); $('#hMon').disabled = !!m; if (m) { $('#hOrg').value = m.org; $('#hMon').value = rentIdxMonth(m); } };
+  if (canWrite) $('#hAdd').onclick = async () => {
+    const pm = RENT.find(x => String(x._id) === $('#hPar').value);
+    const o = { org: pm ? pm.org : $('#hOrg').value, ...(pm ? { parent: Number(pm._id) } : {}), from: $('#hFrom').value, to: '', base: num($('#hBase').value), baseIdx: num($('#hIdx').value), idxMonth: Number($('#hMon').value), m2: num($('#hM2').value), note: $('#hNote').value.trim() };
+    if (!o.org || !o.from || !(o.base > 0)) { $('#hMsg').className = 'err'; $('#hMsg').textContent = 'Organisatie, Van en basishuur zijn verplicht'; return; }
+    try { await LK.save('rent', o); RENT.push(o); renderHuur(); setStatus('live', 'Contractlijn opgeslagen · ' + new Date().toLocaleTimeString('nl-BE', { hour: '2-digit', minute: '2-digit' })); }
+    catch (e) { $('#hMsg').className = 'err'; $('#hMsg').textContent = 'Niet opgeslagen: ' + e.message; }
+  };
+  $('#tHuur').onchange = async e => {
+    const el = e.target.closest('.he'); if (!el) return; const r = RENT.find(x => String(x._id) === el.closest('tr').dataset.id); if (!r) return;
+    const f = el.dataset.f, v = f === 'email' ? el.value.trim() : /from|to/.test(f) ? el.value : f === 'idxMonth' ? Number(el.value) : num(el.value);
+    if (f === 'from' && !v) { renderHuur(); return; }
+    try { await LK.save('rent', { _id: r._id, [f]: v }); r[f] = v ?? ''; renderHuur(); setStatus('live', 'Contractlijn aangepast · herberekend'); }
+    catch (er) { el.style.outline = '2px solid var(--bad)'; setStatus('ro', 'Niet opgeslagen: ' + er.message); }
+  };
+  $('#tHuur').onclick = async e => {
+    const lb = e.target.closest('.hbrief'); if (lb) { const r = RENT.find(x => String(x._id) === lb.closest('tr').dataset.id); if (r) sendLetter(r.org, lb); return; }
+    const b = e.target.closest('.hdel'); if (!b) return; const r = RENT.find(x => String(x._id) === b.closest('tr').dataset.id); if (!r) return;
+    if (!confirm('Contractlijn ' + r.org + ' (vanaf ' + dfmt(r.from) + ') verwijderen?')) return;
+    try { await LK.remove('rent', r._id); RENT = RENT.filter(x => x !== r); renderHuur(); } catch (er) { setStatus('ro', 'Niet verwijderd: ' + er.message); }
+  };
+  // indexlijst
+  const ks = Object.keys(IDX).sort().reverse();
+  $('#tIdx').innerHTML = `<thead><tr><th>Maand</th><th class="num">Gezondheidsindex (2013 = 100)</th></tr></thead><tbody>` + ks.slice(0, 24).map(k => `<tr><td>${ymName(k)}</td><td class="num mono">${fmtIdx(IDX[k])}</td></tr>`).join('') + '</tbody>';
+  $('#idxNew').innerHTML = canWrite ? `<b>Index toevoegen</b> <input type="month" id="iMon"> <input id="iVal" placeholder="bv. 141,91" inputmode="decimal" style="width:100px"> <button class="btn" id="iAdd">Opslaan</button> <a href="https://statbel.fgov.be/nl/themas/consumptieprijsindex/gezondheidsindex" target="_blank" rel="noopener">Statbel</a> <span id="iMsg"></span>` : '';
+  if (canWrite) $('#iAdd').onclick = async () => {
+    const m = $('#iMon').value, v = num($('#iVal').value); if (!m || !(v > 0)) { $('#iMsg').className = 'err'; $('#iMsg').textContent = 'Maand en index invullen'; return; }
+    try { const ex = IDX_ITEMS.find(x => x.month === m); const o = { ...(ex ? { _id: ex._id } : {}), month: m, value: v, src: 'Manueel' }; await LK.save('idx', o); if (!ex) IDX_ITEMS.push(o); else ex.value = v; IDX[m] = v; renderHuur(); }
+    catch (e) { $('#iMsg').className = 'err'; $('#iMsg').textContent = 'Niet opgeslagen: ' + e.message; }
+  };
+}
+let IDX_ITEMS = [], IDX_AUTO = {}, IDX_UPD = '', idxSyncing = false;
+// nieuwe Statbel-maanden ook in de SharePoint-lijst LK_Index zetten (enkel wie mag schrijven)
+async function syncIdx() {
+  if (!canWrite || idxSyncing) return; const have = new Set(IDX_ITEMS.map(x => x.month));
+  const add = Object.entries(IDX_AUTO).filter(([k]) => !have.has(k)).map(([k, v]) => ({ kind: 'idx', op: 'add', obj: { month: k, value: Number(v), src: 'Statbel (automatisch)' } }));
+  if (!add.length) return; idxSyncing = true;
+  try { await LK.batch(add); add.forEach(a => IDX_ITEMS.push(a.obj)); } catch (e) { console.warn('LK_Index niet bijgewerkt', e); } finally { idxSyncing = false; }
+}
 function renderAll(keepPanel) {
   cancelAnimationFrame(raf);
-  raf = requestAnimationFrame(() => { renderPlan(); if (!keepPanel || !document.activeElement?.closest('#panel')) renderPanel(); renderRooms(); renderDoors(); renderIsta(); renderOrgs(); renderOcc(); renderAfr(); });
+  raf = requestAnimationFrame(() => { renderPlan(); if (!keepPanel || !document.activeElement?.closest('#panel')) renderPanel(); renderRooms(); renderDoors(); renderIsta(); renderOrgs(); renderOcc(); renderAfr(); renderHuur(); });
 }
 boot().catch(e => { if (e.message === 'no lists') return; console.error(e); setStatus('ro', 'Laden mislukt'); $('#notice').hidden = false; $('#notice').textContent = 'Het plan kon niet geladen worden: ' + (e.message || e) + '. Herlaad de pagina of meld je opnieuw aan.'; });
 })();
