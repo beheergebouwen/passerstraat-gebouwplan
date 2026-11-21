@@ -19,7 +19,7 @@ jobs:
           U = 'https://statbel.fgov.be/sites/default/files/files/opendata/Consumptieprijsindex%20en%20gezondheidsindex/CPI%20All%20base%20years.zip'
           req = urllib.request.Request(U, headers={'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36', 'Accept': '*/*'})
           raw = urllib.request.urlopen(req, timeout=120).read()
-          if raw[:2] != b'PK': raise SystemExit('Statbel gaf geen zip terug: ' + raw[:200].decode('utf-8', 'replace'))
+          if raw[:2] != b'PK': print('::warning::Statbel blokkeert de automatische download vanaf GitHub (geen zip ontvangen). index.json blijft ongewijzigd; vul een nieuwe maand aan in de app of via index.json.'); raise SystemExit(0)
           z = zipfile.ZipFile(io.BytesIO(raw))
           txt = z.read([n for n in z.namelist() if n.lower().endswith('.txt')][0]).decode('utf-8-sig', 'replace')
           rows = [l.split('|') for l in txt.splitlines() if l.strip()]; h = rows[0]; I = {k: i for i, k in enumerate(h)}
