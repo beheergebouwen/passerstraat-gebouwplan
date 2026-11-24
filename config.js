@@ -8,7 +8,7 @@ window.LK_CONFIG = {
   lists: {
     rooms: "PS_Ruimten", doors: "PS_Deuren", meters: "PS_IstaMeters",
     orgs: "PS_Organisaties", settings: "PS_Instellingen", occ: "PS_Bezetting", costs: "PS_Kosten",
-    vo: "PS_Voorschotten", imp: "PS_Imports", rent: "PS_Huur", idx: "PS_Index"
+    vo: "PS_Voorschotten", imp: "PS_Imports", rent: "PS_Huur", idx: "PS_Index", corr: "PS_Correcties"
   },
   noIsta: true,                                          // geen Ista-meters in dit gebouw
   importFolder: "Passerstraat/Imports"                   // map voor originele importbestanden (Exact)

@@ -55,7 +55,8 @@ async function boot() {
   setInterval(() => { if (!document.hidden && !document.activeElement?.closest('form,select,input,textarea')) reload().then(() => renderAll(true)); }, 60000);
 }
 async function reload(first) {
-  const [rooms, doors, meters, orgs, settings, occ, costs, vo, imp, rent, idx] = await Promise.all(['rooms', 'doors', 'meters', 'orgs', 'settings', 'occ', 'costs', 'vo', 'imp', 'rent', 'idx'].map(k => LK.load(k).catch(() => null)));
+  const [rooms, doors, meters, orgs, settings, occ, costs, vo, imp, rent, idx, corr] = await Promise.all(['rooms', 'doors', 'meters', 'orgs', 'settings', 'occ', 'costs', 'vo', 'imp', 'rent', 'idx', 'corr'].map(k => LK.load(k).catch(() => null)));
+  CORR = (corr || []).filter(x => x.cid && x.field); CORR_OK = !!corr;
   COSTS = costs || []; VOS = (vo || []).filter(v => v.org); IMPS = imp || [];
   RENT = (rent || []).filter(r => r.org); IDX_ITEMS = (idx || []).filter(x => x.month && x.value !== ''); IDX = Object.fromEntries(IDX_ITEMS.map(x => [x.month, Number(x.value)]));
   // index.json wordt elke dag automatisch bijgewerkt vanuit Statbel (GitHub Action); ontbrekende maanden aanvullen + bewaren in LK_Index
@@ -578,7 +579,7 @@ function orgPdf(sel) {
 }
 function afrOrgs(cs) { const set = new Set(); cs.forEach(c => Object.keys(split(c)).forEach(o => set.add(o))); return [...ORGS.map(o => o.name).filter(n => set.has(n)), ...[...set].filter(n => !ORGS.some(o => o.name === n))]; }
 function renderAfr() {
-  if (!per || !$('#v-afr')) return; bindAfr(); bindImport(); PSC = {};
+  if (!per || !$('#v-afr')) return; bindAfr(); bindImport(); bindCorr(); PSC = {};
   const li = IMPS.slice().sort((a, b) => (b._id | 0) - (a._id | 0))[0];
   $('#afrLog').innerHTML = li ? `Laatste import: <b>${esc(li.file)}</b> op ${esc(li.at)} (boekdatum ${dfmt(li.from)} – ${dfmt(li.to)}, ${li.added || 0} nieuw, ${li.changed || 0} bijgewerkt, ${li.removed || 0} verwijderd) · ${IMPS.length} import(s) in totaal` : 'Nog geen import uit Exact.';
   $('#aFrom').value = per.from; $('#aTo').value = per.to;
@@ -628,10 +629,11 @@ function renderAfr() {
     $('#rulesBox').onclick = async e => { const b = e.target.closest('.rdel'); if (!b) return; delete RULES[b.dataset.k]; await saveRules(); renderAfr(); };
   }
   $('#tAfr').innerHTML = cs.length ? `<thead><tr><th>Categorie</th><th>Omschrijving</th><th>Periode</th><th class="num">Bedrag</th><th>Sleutel</th>${orgs.map(o => `<th class="num"><span class="swatch" style="background:${orgColor(o) || '#ddd'}"></span>${esc(o)}</th>`).join('')}<th></th></tr></thead><tbody>` +
-    cs.map(c => { const sp = split(c); return `<tr data-id="${esc(c._id)}"><td>${canWrite ? `<select class="ce" data-f="cat">${[...new Set([...CATS, c.cat || ''])].filter(Boolean).map(x => `<option${x === c.cat ? ' selected' : ''}>${esc(x)}</option>`).join('')}</select>` : esc(c.cat)}</td><td class="wrap">${esc(c.desc)}${c.supplier || c.invoice || c.meter ? `<br><span class="empty" style="font-size:11px">${esc([c.supplier, c.invoice && 'factuur ' + c.invoice, c.entry && 'boekstuk ' + c.entry, c.gl, c.meter && 'meter ' + c.meter].filter(Boolean).join(' · '))}</span>` : ''}${c.cu && !/^huurpat$/i.test(c.cu) ? '<br><span class="imp-warn">⚠ geen HUURPAT in Exact</span>' : ''}</td>
-      <td class="mono" style="font-size:12px;white-space:nowrap">${canWrite ? `<input type="date" class="ce" data-f="from" value="${c.from || ''}"><br><input type="date" class="ce" data-f="to" value="${c.to || ''}">` : dfmt(c.from) + '<br>' + dfmt(c.to)}</td><td class="num mono">${eur2(amtIn(c))}<br><span class="empty" style="font-size:10px">excl. ${eur2(Number(c.amount) || 0)} + btw ${canWrite ? `<select class="ce" data-f="vat" style="font-size:10px;padding:0">${[0, 6, 21].map(v => `<option value="${v}"${v === (Number(c.vat) || 0) ? ' selected' : ''}>${v}%</option>`).join('')}</select>` : (Number(c.vat) || 0) + '%'} = ${eur2(amtIn(c) - (Number(c.amount) || 0) * ovl(c).f)}${ovl(c).f < 0.9999 ? ` · ${Math.round(ovl(c).f * 100)}%` : ''}</span></td><td style="font-size:12px">${canWrite ? `<select class="ce" data-f="key">${KEYS.map(k => `<option${k === (c.key || KDEF) ? ' selected' : ''}>${esc(k)}</option>`).join('')}</select>${c.key === KEYS[3] ? `<div style="margin-top:4px;line-height:1.5">${ORGS.map(o => `<label style="display:block;white-space:nowrap"><input type="checkbox" class="ce" data-f="orgs" value="${esc(o.name)}"${String(c.org || '').split(' + ').includes(o.name) ? ' checked' : ''}> ${esc(o.name)}</label>`).join('')}${String(c.org || '').includes(' + ') ? '<span class="empty" style="font-size:10px">verdeeld naar bezette m²</span>' : ''}</div>` : ''}` : esc(c.key) + (c.org ? '<br><b>' + esc(c.org) + '</b>' : '')}${SIMKEY && c.key !== KEYS[3] ? '<br><span class="imp-warn">simulatie: ' + esc(SIMKEY) + '</span>' : ''}</td>
+    cs.map(c => { const sp = split(c); return `<tr data-id="${esc(c._id)}"><td class="${corrTd(c, ['cat', 'del'])}">${canWrite ? `<select class="ce" data-f="cat">${[...new Set([...CATS, c.cat || ''])].filter(Boolean).map(x => `<option${x === c.cat ? ' selected' : ''}>${esc(x)}</option>`).join('')}</select>` : esc(c.cat)}${corrMark(c, ['cat'])}</td><td class="wrap">${esc(c.desc)}${c.supplier || c.invoice || c.meter ? `<br><span class="empty" style="font-size:11px">${esc([c.supplier, c.invoice && 'factuur ' + c.invoice, c.entry && 'boekstuk ' + c.entry, c.gl, c.meter && 'meter ' + c.meter].filter(Boolean).join(' · '))}</span>` : ''}${c.cu && !/^huurpat$/i.test(c.cu) ? '<br><span class="imp-warn">⚠ geen HUURPAT in Exact</span>' : ''}</td>
+      <td class="mono ${corrTd(c, ['from', 'to'])}" style="font-size:12px;white-space:nowrap">${canWrite ? `<input type="date" class="ce" data-f="from" value="${c.from || ''}"><br><input type="date" class="ce" data-f="to" value="${c.to || ''}">` : dfmt(c.from) + '<br>' + dfmt(c.to)}${corrMark(c, ['from', 'to'])}</td><td class="num mono ${corrTd(c, ['vat'])}">${corrMark(c, ['vat'])}${eur2(amtIn(c))}<br><span class="empty" style="font-size:10px">excl. ${eur2(Number(c.amount) || 0)} + btw ${canWrite ? `<select class="ce" data-f="vat" style="font-size:10px;padding:0">${[0, 6, 21].map(v => `<option value="${v}"${v === (Number(c.vat) || 0) ? ' selected' : ''}>${v}%</option>`).join('')}</select>` : (Number(c.vat) || 0) + '%'} = ${eur2(amtIn(c) - (Number(c.amount) || 0) * ovl(c).f)}${ovl(c).f < 0.9999 ? ` · ${Math.round(ovl(c).f * 100)}%` : ''}</span></td><td class="${corrTd(c, ['key', 'org'])}" style="font-size:12px">${corrMark(c, ['key', 'org'])}${canWrite ? `<select class="ce" data-f="key">${KEYS.map(k => `<option${k === (c.key || KDEF) ? ' selected' : ''}>${esc(k)}</option>`).join('')}</select>${c.key === KEYS[3] ? `<div style="margin-top:4px;line-height:1.5">${ORGS.map(o => `<label style="display:block;white-space:nowrap"><input type="checkbox" class="ce" data-f="orgs" value="${esc(o.name)}"${String(c.org || '').split(' + ').includes(o.name) ? ' checked' : ''}> ${esc(o.name)}</label>`).join('')}${String(c.org || '').includes(' + ') ? '<span class="empty" style="font-size:10px">verdeeld naar bezette m²</span>' : ''}</div>` : ''}` : esc(c.key) + (c.org ? '<br><b>' + esc(c.org) + '</b>' : '')}${SIMKEY && c.key !== KEYS[3] ? '<br><span class="imp-warn">simulatie: ' + esc(SIMKEY) + '</span>' : ''}</td>
       ${orgs.map(o => `<td class="num mono">${sp[o] ? eur2(sp[o]) : '–'}</td>`).join('')}<td>${canWrite ? '<button class="occdel cdel" title="Verwijderen">✕</button>' : ''}</td></tr>`; }).join('') +
     `</tbody><tfoot><tr><th colspan="3">Totaal</th><th class="num mono">${eur2(total)}</th><th></th>${orgs.map(o => `<th class="num mono">${eur2(tot[o] || 0)}</th>`).join('')}<th></th></tr></tfoot>` : '<tbody><tr><td class="empty">Nog geen kostenposten in deze periode. Voeg ze hierboven toe.</td></tr></tbody>';
+  renderCorr();
   $('#tAfr').onchange = async e => {
     const el = e.target.closest('.ce'); if (!el) return; const tr = el.closest('tr'), c = COSTS.find(x => String(x._id) === tr.dataset.id); if (!c) return;
     let f = el.dataset.f; const patch = { _id: c._id, [f]: f === 'vat' ? Number(el.value) : el.value };
@@ -639,15 +641,94 @@ function renderAfr() {
     if (f === 'key') { patch.org = el.value === KEYS[3] ? (c.org || 'De Overmolen') : ''; }
     if (f === 'cat') { /* enkel categorie */ }
     if ((f === 'from' && el.value > (c.to || '9')) || (f === 'to' && el.value < (c.from || '0'))) { setStatus('ro', "'Tot' ligt vóór 'Van' – niet opgeslagen"); renderAfr(); return; }
-    try { await LK.save('costs', patch); Object.assign(c, patch); PSC = {}; if (c.src === 'Exact' && /cat|key|org/.test(f)) { learn(c, { cat: c.cat, key: c.key, org: c.key === KEYS[3] ? c.org : '' }); saveRules(); } renderAfr(); setStatus('live', 'Kostenpost aangepast · herberekend · ' + new Date().toLocaleTimeString('nl-BE', { hour: '2-digit', minute: '2-digit' })); }
+    const before = { ...c };
+    try { await LK.save('costs', patch); Object.assign(c, patch); PSC = {}; if (c.src === 'Exact' && /cat|key|org/.test(f)) { learn(c, { cat: c.cat, key: c.key, org: c.key === KEYS[3] ? c.org : '' }); saveRules(); } for (const k of Object.keys(patch)) if (k !== '_id' && String(before[k] ?? '') !== String(c[k] ?? '')) await logCorr(c, k, before[k], c[k]);
+      renderAfr(); setStatus('live', 'Kostenpost aangepast · herberekend · ' + new Date().toLocaleTimeString('nl-BE', { hour: '2-digit', minute: '2-digit' })); }
     catch (er) { setStatus('ro', 'Niet opgeslagen: ' + (er.status === 403 ? 'geen bewerkrechten' : er.message)); renderAfr(); }
   };
   $('#tAfr').onclick = async e => {
     const b = e.target.closest('.cdel'); if (!b) return; const tr = b.closest('tr');
     if (!tr.dataset.confirm) { tr.dataset.confirm = 1; b.textContent = 'Zeker?'; b.style.width = 'auto'; return; }
     const c = COSTS.find(x => String(x._id) === tr.dataset.id); if (!c) return;
-    try { await LK.remove('costs', c._id); COSTS = COSTS.filter(x => x !== c); if (c.src === 'Exact') { learn(c, { on: false }); saveRules(); } renderAfr(); } catch (er) { setStatus('ro', 'Niet verwijderd: ' + er.message); }
+    try { await LK.remove('costs', c._id); COSTS = COSTS.filter(x => x !== c); await logCorr(c, 'del', 'in de afrekening', 'verwijderd uit de afrekening'); if (c.src === 'Exact') { learn(c, { on: false }); saveRules(); } renderAfr(); } catch (er) { setStatus('ro', 'Niet verwijderd: ' + er.message); }
   };
+}
+let CORR = [], CORR_OK = false;
+// ---------- correcties voor de boekhouding: elke wijziging aan een Exact-lijn wordt bewaard (oud → nieuw, wie, wanneer, reden)
+// rood = nog aan te passen in Exact · groen = de boekhouder heeft "Aangepast in Exact" aangevinkt
+const CF = { cat: 'Categorie', from: 'Periode van', to: 'Periode tot', vat: 'Btw', key: 'Verdeelsleutel', org: 'Organisatie / eigenaar of huurder', del: 'Niet in de afrekening (geen huurderskost)' };
+const cfv = (f, v) => v === '' || v == null ? '(leeg)' : /^(from|to)$/.test(f) ? dfmt(v) : f === 'vat' ? v + '%' : String(v);
+const nowTxt = () => { const d = new Date(); return ymd(d) + ' ' + d.toLocaleTimeString('nl-BE', { hour: '2-digit', minute: '2-digit' }); };
+const corrOf = (c, fs) => CORR.filter(x => x.cid === String(c._id) && (!fs || fs.includes(x.field)));
+function corrMark(c, fs) {
+  const L = corrOf(c, fs); if (!L.length) return '';
+  const open = L.some(x => !x.done), t = L.map(x => `${CF[x.field] || x.field}: ${cfv(x.field, x.old)} → ${cfv(x.field, x.new)}${x.done ? ' · aangepast in Exact' : ' · nog aan te passen in Exact'}`).join('\n');
+  return ` <button class="cmk ${open ? 'open' : 'done'}" data-cid="${esc(c._id)}" title="${esc(t)}" aria-label="Correctie bekijken">${open ? '●' : '✓'}</button>`;
+}
+const corrTd = (c, fs) => { const L = corrOf(c, fs); return L.length ? (L.some(x => !x.done) ? 'c-open' : 'c-done') : ''; };
+async function logCorr(c, f, oldV, newV) {
+  if (!CORR_OK || c.src !== 'Exact') return;
+  oldV = oldV == null ? '' : String(oldV); newV = newV == null ? '' : String(newV);
+  const ex = CORR.find(x => x.cid === String(c._id) && x.field === f && !x.done);
+  try {
+    if (ex) { if (newV === ex.old) { await LK.remove('corr', ex._id); CORR = CORR.filter(x => x !== ex); } else { ex.new = newV; ex.who = $('#who').textContent; ex.at = nowTxt(); await LK.save('corr', { _id: ex._id, new: newV, who: ex.who, at: ex.at }); } return; }
+    if (oldV === newV) return;
+    const o = { cid: String(c._id), desc: `${c.desc || ''} · ${eur2(Number(c.amount) || 0)} excl. btw${c.bdate ? ' · boekdatum ' + dfmt(c.bdate) : ''}`.slice(0, 250), entry: c.entry || c.invoice || '', field: f, old: oldV, new: newV, reason: '', who: $('#who').textContent, at: nowTxt(), done: false, doneBy: '', doneAt: '' };
+    await LK.save('corr', o); CORR.push(o);
+  } catch (er) { setStatus('ro', 'Correctie niet bewaard: ' + er.message); }
+}
+async function setCorr(x, ch) {
+  try { await LK.save('corr', { _id: x._id, ...ch }); Object.assign(x, ch); setStatus('live', 'Correctie bewaard · ' + nowTxt().slice(11)); }
+  catch (er) { setStatus('ro', 'Niet bewaard: ' + (er.status === 403 ? 'geen rechten op PS_Correcties' : er.message)); throw er; }
+}
+const corrRow = (x, pop) => `<tr data-k="${esc(x._id)}" class="${x.done ? 'c-done' : 'c-open'}">
+  <td><label class="check" title="Aanvinken als dit in Exact is aangepast"><input type="checkbox" class="cdone"${x.done ? ' checked' : ''}> ${x.done ? 'Aangepast in Exact' : '<b>Nog aanpassen</b>'}</label>${x.done && x.doneBy ? `<br><span class="empty" style="font-size:11px">${esc(x.doneBy)} · ${esc(x.doneAt)}</span>` : ''}</td>
+  ${pop ? '' : `<td class="wrap">${esc(x.desc)}${x.entry ? `<br><span class="empty" style="font-size:11px">boekstuk ${esc(x.entry)}</span>` : ''}</td>`}
+  <td><b>${esc(CF[x.field] || x.field)}</b></td><td class="mono">${esc(cfv(x.field, x.old))}</td><td class="mono"><b>${esc(cfv(x.field, x.new))}</b></td>
+  <td><input class="creason" value="${esc(x.reason || '')}" placeholder="Waarom? (reden)" style="width:100%;min-width:160px;font-size:12px"></td>
+  <td style="font-size:12px">${esc(x.who)}<br><span class="empty">${esc(x.at)}</span></td></tr>`;
+async function corrChange(e) {
+  const tr = e.target.closest('tr[data-k]'); if (!tr) return; const x = CORR.find(y => String(y._id) === tr.dataset.k); if (!x) return;
+  try {
+    if (e.target.classList.contains('cdone')) await setCorr(x, e.target.checked ? { done: true, doneBy: $('#who').textContent, doneAt: nowTxt() } : { done: false, doneBy: '', doneAt: '' });
+    else if (e.target.classList.contains('creason')) await setCorr(x, { reason: e.target.value.trim() });
+  } catch (er) {}
+  renderAfr(); if (!$('#corrPop').hidden) openCorr($('#corrPop').dataset.cid);
+}
+function openCorr(cid) {
+  const c = COSTS.find(x => String(x._id) === String(cid)), L = CORR.filter(x => x.cid === String(cid)), pop = $('#corrPop');
+  if (!L.length) { pop.hidden = true; return; }
+  pop.dataset.cid = cid; pop.hidden = false;
+  pop.innerHTML = `<div style="display:flex;justify-content:space-between;gap:12px;align-items:start"><div><b>Correcties</b><br><span class="empty" style="font-size:12px">${esc(c ? c.desc : L[0].desc)}</span></div><button class="btn" id="corrClose" style="padding:2px 10px">✕</button></div>
+    <table style="margin-top:8px"><thead><tr><th>Status</th><th>Wat</th><th>Was (Exact)</th><th>Wordt</th><th>Reden</th><th>Door</th></tr></thead><tbody>${L.map(x => corrRow(x, true)).join('')}</tbody></table>
+    <p class="empty" style="font-size:12px;margin:8px 0 0">Rood = nog aan te passen in Exact. De boekhouder vinkt "Aangepast in Exact" aan → groen.</p>`;
+  $('#corrClose').onclick = () => { pop.hidden = true; };
+  pop.onchange = corrChange;
+}
+function renderCorr() {
+  if (!$('#tCorr')) return;
+  if (!CORR_OK) { $('#corrInfo').innerHTML = '<span class="imp-warn">De lijst PS_Correcties bestaat nog niet in SharePoint.</span>'; $('#tCorr').innerHTML = ''; return; }
+  const f = $('#corrF').value || 'open', L = CORR.filter(x => f === 'alle' || (f === 'open' ? !x.done : x.done)).sort((a, b) => (a.done - b.done) || String(b.at).localeCompare(String(a.at)));
+  const nO = CORR.filter(x => !x.done).length, nD = CORR.length - nO;
+  $('#corrInfo').innerHTML = `<b class="${nO ? 'err' : 'saved'}" style="font-size:13px">${nO} nog aan te passen in Exact</b> · <span class="saved" style="font-size:13px">${nD} aangepast</span>`;
+  $('#tCorr').innerHTML = L.length ? `<thead><tr><th>Status</th><th>Kostenpost</th><th>Wat</th><th>Was (Exact)</th><th>Wordt</th><th>Reden</th><th>Door</th></tr></thead><tbody>${L.map(x => corrRow(x, false)).join('')}</tbody>` : `<tbody><tr><td class="empty">${f === 'open' ? 'Geen open correcties. ✓' : 'Geen correcties.'}</td></tr></tbody>`;
+  $('#tCorr').onchange = corrChange;
+}
+function bindCorr() {
+  if (bindCorr.done || !$('#corrF')) return; bindCorr.done = true;
+  $('#corrF').onchange = renderCorr;
+  $('#corrCsv').onclick = () => exportCsv('Passerstraat_correcties_boekhouding_' + ymd(new Date()) + '.csv', ['status', 'kostenpost', 'boekstuk', 'wat', 'was (Exact)', 'wordt', 'reden', 'door', 'datum', 'aangepast in Exact door', 'aangepast op'],
+    CORR.slice().sort((a, b) => (a.done - b.done) || String(a.at).localeCompare(String(b.at))).map(x => [x.done ? 'aangepast in Exact' : 'nog aanpassen', x.desc, x.entry, CF[x.field] || x.field, cfv(x.field, x.old), cfv(x.field, x.new), x.reason, x.who, x.at, x.doneBy, x.doneAt]));
+  $('#corrPdf').onclick = () => {
+    const f = $('#corrF').value || 'open', L = CORR.filter(x => f === 'alle' || (f === 'open' ? !x.done : x.done)).sort((a, b) => (a.done - b.done) || String(a.at).localeCompare(String(b.at)));
+    $('#afrPdf').innerHTML = `<section class="orgpdf"><div class="ph"><div>Passerstraat · VZW De Overmolen<h1>Correcties voor de boekhouding</h1>Graag aanpassen in Exact Online</div><div style="text-align:right">Opgemaakt op ${dfmt(ymd(new Date()))}<br>door ${esc($('#who').textContent)}<br>${L.filter(x => !x.done).length} open · ${L.filter(x => x.done).length} aangepast</div></div>
+      <p>Bij het nakijken van de afrekening zijn deze boekingen aangepast. Pas ze ook aan in Exact. Daarna vinkt u in de app <b>"Aangepast in Exact"</b> aan (tab Afrekening → Correcties voor de boekhouding).</p>
+      <table><thead><tr><th>Status</th><th>Kostenpost</th><th>Wat</th><th>Was (Exact)</th><th>Wordt</th><th>Reden</th><th>Door / datum</th></tr></thead><tbody>${L.map(x => `<tr><td style="color:${x.done ? '#1b7f3b' : '#b00020'};font-weight:700">${x.done ? '✓ aangepast' + (x.doneBy ? '<br><span class="sml">' + esc(x.doneBy) + ' ' + esc(x.doneAt) + '</span>' : '') : '● aanpassen'}</td><td>${esc(x.desc)}${x.entry ? '<br><span class="sml">boekstuk ' + esc(x.entry) + '</span>' : ''}</td><td>${esc(CF[x.field] || x.field)}</td><td>${esc(cfv(x.field, x.old))}</td><td><b>${esc(cfv(x.field, x.new))}</b></td><td>${esc(x.reason || '')}</td><td class="sml">${esc(x.who)}<br>${esc(x.at)}</td></tr>`).join('') || '<tr><td colspan="7">Geen correcties.</td></tr>'}</tbody></table>
+      <p class="pf">Rood = nog aan te passen in Exact · groen = aangepast. Lijst uit de app Passerstraat Gebouwplan (SharePoint-lijst PS_Correcties).</p></section>`;
+    const t = document.title; document.title = 'Passerstraat_correcties_boekhouding_' + ymd(new Date());
+    document.body.classList.add('print-org'); window.print(); setTimeout(() => { document.body.classList.remove('print-org'); document.title = t; }, 500);
+  };
+  document.addEventListener('click', e => { const b = e.target.closest('.cmk'); if (b) { e.preventDefault(); openCorr(b.dataset.cid); return; } const td = e.target.closest('#tAfr td.c-open, #tAfr td.c-done'); if (td && !e.target.closest('select,input,label,option,button')) openCorr(td.closest('tr').dataset.id); });
 }
 // ---------- import Exact Online (export "FinTransactionSearch": CSV/TXT, tab of ; gescheiden, UTF-16 of UTF-8)
 const ORG_ALIAS = [[/kuumba/i, 'Kuumba'], [/baita|sociaal verhuurkantoor|\bsvk\b/i, 'Baita'], [/overmolen/i, 'De Overmolen']];
