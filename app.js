@@ -735,7 +735,7 @@ function bindCorr() {
       try { await LK.remove('corr', x._id); CORR = CORR.filter(y => y !== x); setStatus('live', 'Correctie verwijderd · ' + nowTxt().slice(11)); } catch (er) { setStatus('ro', 'Niet verwijderd: ' + (er.status === 403 ? 'geen rechten' : er.message)); }
       renderAfr(); if (!$('#corrPop').hidden) openCorr($('#corrPop').dataset.cid); return; }
     const b = e.target.closest('.cmk'); if (b) { e.preventDefault(); openCorr(b.dataset.cid); return; }
-    const td = e.target.closest('#tAfr td.c-open, #tAfr td.c-done'); if (td && !e.target.closest('select,input,label,option,button,.ochk')) openCorr(td.closest('tr').dataset.id); });
+    const td = e.target.closest('#tAfr td.c-open, #tAfr td.c-done'); if (td && !e.target.closest('select,input,option,button')) openCorr(td.closest('tr').dataset.id); });
 }
 // ---------- import Exact Online (export "FinTransactionSearch": CSV/TXT, tab of ; gescheiden, UTF-16 of UTF-8)
 const ORG_ALIAS = [[/kuumba/i, 'Kuumba'], [/baita|sociaal verhuurkantoor|\bsvk\b/i, 'Baita'], [/overmolen/i, 'De Overmolen']];
